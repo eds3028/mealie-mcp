@@ -1,0 +1,26 @@
+# Add this service to your existing Mealie docker-compose.yml.
+# It assumes Mealie is reachable on the same Docker network as `mealie:9000`.
+# Adjust image/build and env values to match your environment.
+
+services:
+  mealie-mcp:
+    build:
+      context: ./mealie-mcp
+      # Or use a pre-built image:
+      # image: ghcr.io/eds3028/mealie-mcp:latest
+    container_name: mealie-mcp
+    restart: unless-stopped
+    depends_on:
+      - mealie
+    environment:
+      MEALIE_URL: "http://mealie:9000"
+      MEALIE_API_TOKEN: "${MEALIE_API_TOKEN}"
+      MCP_TRANSPORT: "sse"
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8000"
+    ports:
+      # Expose the SSE endpoint on the host. Remove this if you only need
+      # internal access from another container on the same network.
+      - "8765:8000"
+    networks:
+      - default
