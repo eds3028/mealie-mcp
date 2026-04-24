@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from mcp.server.fastmcp import Context, FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from .client import MealieClient, MealieError
 
@@ -27,6 +30,43 @@ def _load_settings() -> tuple[str, str]:
     if not token:
         raise RuntimeError("MEALIE_API_TOKEN environment variable is required")
     return base_url, token
+
+
+def _configure_transport_security(server: FastMCP) -> None:
+    """Configure DNS rebinding protection and CORS based on env vars."""
+    allowed_hosts = os.environ.get("MCP_ALLOWED_HOSTS", "").strip()
+    allowed_origins = os.environ.get("MCP_ALLOWED_ORIGINS", "").strip()
+
+    if allowed_hosts:
+        hosts = [h.strip() for h in allowed_hosts.split(",") if h.strip()]
+        server.settings.transport_security.allowed_hosts.extend(hosts)
+
+    if allowed_origins:
+        origins = [o.strip() for o in allowed_origins.split(",") if o.strip()]
+        server.settings.transport_security.allowed_origins.extend(origins)
+
+
+class BearerTokenAuth(BaseHTTPMiddleware):
+    """Middleware to enforce bearer token auth on MCP endpoints."""
+
+    def __init__(self, app, token: str | None = None):
+        super().__init__(app)
+        self.token = token
+
+    async def dispatch(self, request: Request, call_next):
+        if not self.token:
+            return await call_next(request)
+
+        if request.url.path in ("/sse", "/messages/", "/mcp"):
+            auth_header = request.headers.get("authorization", "").lower()
+            expected = f"bearer {self.token}"
+            if auth_header != expected:
+                return JSONResponse(
+                    {"error": "Unauthorized"},
+                    status_code=401,
+                )
+
+        return await call_next(request)
 
 
 @asynccontextmanager
@@ -219,17 +259,26 @@ def run() -> None:
         server.run(transport="stdio")
         return
 
-    if transport in ("sse", "http"):
+    if transport in ("sse", "http", "streamable-http"):
         host = os.environ.get("MCP_HOST", "0.0.0.0")
         port = int(os.environ.get("MCP_PORT", "8000"))
-        # FastMCP reads host/port from its settings object.
+        bearer_token = os.environ.get("MCP_BEARER_TOKEN", "").strip() or None
+
         server.settings.host = host
         server.settings.port = port
-        server.run(transport="sse")
+        _configure_transport_security(server)
+
+        if bearer_token:
+            server.app.add_middleware(BearerTokenAuth, token=bearer_token)
+
+        if transport in ("sse", "http"):
+            server.run(transport="sse")
+        else:
+            server.run(transport="streamable-http")
         return
 
     raise RuntimeError(
-        f"Unknown MCP_TRANSPORT '{transport}'. Use 'stdio' or 'sse'."
+        f"Unknown MCP_TRANSPORT '{transport}'. Use 'stdio', 'sse', or 'streamable-http'."
     )
 
 
