@@ -8,9 +8,6 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from mcp.server.fastmcp import Context, FastMCP
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from .client import MealieClient, MealieError
 
@@ -44,29 +41,6 @@ def _configure_transport_security(server: FastMCP) -> None:
     if allowed_origins:
         origins = [o.strip() for o in allowed_origins.split(",") if o.strip()]
         server.settings.transport_security.allowed_origins.extend(origins)
-
-
-class BearerTokenAuth(BaseHTTPMiddleware):
-    """Middleware to enforce bearer token auth on MCP endpoints."""
-
-    def __init__(self, app, token: str | None = None):
-        super().__init__(app)
-        self.token = token
-
-    async def dispatch(self, request: Request, call_next):
-        if not self.token:
-            return await call_next(request)
-
-        if request.url.path in ("/sse", "/messages/", "/mcp"):
-            auth_header = request.headers.get("authorization", "").lower()
-            expected = f"bearer {self.token}"
-            if auth_header != expected:
-                return JSONResponse(
-                    {"error": "Unauthorized"},
-                    status_code=401,
-                )
-
-        return await call_next(request)
 
 
 @asynccontextmanager
@@ -262,14 +236,10 @@ def run() -> None:
     if transport in ("sse", "http", "streamable-http"):
         host = os.environ.get("MCP_HOST", "0.0.0.0")
         port = int(os.environ.get("MCP_PORT", "8000"))
-        bearer_token = os.environ.get("MCP_BEARER_TOKEN", "").strip() or None
 
         server.settings.host = host
         server.settings.port = port
         _configure_transport_security(server)
-
-        if bearer_token:
-            server.app.add_middleware(BearerTokenAuth, token=bearer_token)
 
         if transport in ("sse", "http"):
             server.run(transport="sse")
