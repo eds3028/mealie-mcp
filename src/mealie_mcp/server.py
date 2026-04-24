@@ -178,6 +178,71 @@ def build_server() -> FastMCP:
         return {"slug": slug, "name": name}
 
     @mcp.tool()
+    async def update_recipe(
+        ctx: Context,
+        slug: str,
+        name: str | None = None,
+        description: str | None = None,
+        recipe_yield: str | None = None,
+        recipe_servings: float | None = None,
+        prep_time: str | None = None,
+        cook_time: str | None = None,
+        total_time: str | None = None,
+        ingredients: list[str] | None = None,
+        instructions: list[str] | None = None,
+        notes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Update fields on an existing recipe. Only provided fields are changed.
+
+        Use this after ``create_recipe`` to populate ingredients, instructions,
+        description, servings, and other content. ``ingredients``, ``instructions``,
+        and ``notes`` replace the existing lists when provided.
+
+        Args:
+            slug: The recipe slug returned by ``create_recipe`` or ``search_recipes``.
+            name: New recipe name.
+            description: Recipe description / summary.
+            recipe_yield: Free-text yield, e.g. "8 servings" or "1 loaf".
+            recipe_servings: Numeric serving count, e.g. 4.
+            prep_time: Free-text prep time, e.g. "15 min".
+            cook_time: Free-text cook time, e.g. "30 min".
+            total_time: Free-text total time.
+            ingredients: Ingredient lines as plain strings, e.g. ["2 cups flour", "1 tsp salt"].
+            instructions: Ordered instruction steps as plain strings.
+            notes: Free-text recipe notes (one entry per note).
+        """
+        patch: dict[str, Any] = {}
+        if name is not None:
+            patch["name"] = name
+        if description is not None:
+            patch["description"] = description
+        if recipe_yield is not None:
+            patch["recipeYield"] = recipe_yield
+        if recipe_servings is not None:
+            patch["recipeServings"] = recipe_servings
+        if prep_time is not None:
+            patch["prepTime"] = prep_time
+        if cook_time is not None:
+            patch["cookTime"] = cook_time
+        if total_time is not None:
+            patch["totalTime"] = total_time
+        if ingredients is not None:
+            patch["recipeIngredient"] = [{"note": line} for line in ingredients]
+        if instructions is not None:
+            patch["recipeInstructions"] = [{"text": step} for step in instructions]
+        if notes is not None:
+            patch["notes"] = [{"title": "", "text": text} for text in notes]
+
+        if not patch:
+            raise ValueError("Provide at least one field to update")
+
+        try:
+            updated = await _client(ctx).update_recipe(slug, patch)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return _summarize_recipe(updated) if isinstance(updated, dict) else {"slug": slug}
+
+    @mcp.tool()
     async def create_meal_plan_entry(
         ctx: Context,
         date: str,

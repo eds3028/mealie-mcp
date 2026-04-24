@@ -113,6 +113,16 @@ class MealieClient:
             return result["slug"]
         raise MealieError(500, "Unexpected response from create_recipe", result)
 
+    async def update_recipe(self, slug: str, patch: dict[str, Any]) -> dict[str, Any]:
+        """Partially update a recipe. Mealie requires the full resource on PUT,
+        so we fetch, merge, and send back.
+        """
+        current = await self.get_recipe(slug)
+        if not isinstance(current, dict):
+            raise MealieError(500, "Unexpected response from get_recipe", current)
+        merged = {**current, **patch}
+        return await self._request("PUT", f"/api/recipes/{slug}", json=merged)
+
     # ---- Meal plans --------------------------------------------------------------
 
     async def list_meal_plan(self, start_date: str, end_date: str) -> dict[str, Any]:
