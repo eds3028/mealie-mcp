@@ -54,3 +54,18 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Make package public
+        if: github.ref == 'refs/heads/main'
+        run: |
+          gh api graphql -f query='
+            mutation {
+              updateRepositoryVisibility(input: {repositoryId: "${{ github.repository_id }}", visibility: PUBLIC}) {
+                repository {
+                  visibility
+                }
+              }
+            }
+          '
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
