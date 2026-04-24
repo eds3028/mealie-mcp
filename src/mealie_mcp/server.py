@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import os
+import secrets
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import urljoin
 
 from mcp.server.fastmcp import Context, FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse, RedirectResponse
 
 from .client import MealieClient, MealieError
+from .auth import OAuthConfig, verify_oauth_token
+
+logger = logging.getLogger(__name__)
 
 EntryType = Literal["breakfast", "lunch", "dinner", "side"]
 
@@ -17,16 +26,37 @@ EntryType = Literal["breakfast", "lunch", "dinner", "side"]
 @dataclass
 class AppContext:
     client: MealieClient
+    oauth_config: OAuthConfig | None = None
+    oauth_sessions: dict[str, str] = None  # state -> access_token mapping
+
+    def __post_init__(self):
+        if self.oauth_sessions is None:
+            self.oauth_sessions = {}
 
 
-def _load_settings() -> tuple[str, str]:
+def _load_settings() -> tuple[str, str, OAuthConfig | None]:
     base_url = os.environ.get("MEALIE_URL", "").strip()
     token = os.environ.get("MEALIE_API_TOKEN", "").strip()
     if not base_url:
         raise RuntimeError("MEALIE_URL environment variable is required")
     if not token:
         raise RuntimeError("MEALIE_API_TOKEN environment variable is required")
-    return base_url, token
+
+    oauth_config = None
+    oauth_issuer = os.environ.get("OAUTH_ISSUER_URL", "").strip()
+    oauth_client_id = os.environ.get("OAUTH_CLIENT_ID", "").strip()
+    oauth_client_secret = os.environ.get("OAUTH_CLIENT_SECRET", "").strip()
+    oauth_server_url = os.environ.get("OAUTH_SERVER_URL", "").strip()
+
+    if oauth_issuer and oauth_client_id and oauth_client_secret and oauth_server_url:
+        oauth_config = OAuthConfig(
+            issuer_url=oauth_issuer,
+            client_id=oauth_client_id,
+            client_secret=oauth_client_secret,
+            server_url=oauth_server_url,
+        )
+
+    return base_url, token, oauth_config
 
 
 def _configure_transport_security(server: FastMCP) -> None:
@@ -45,10 +75,10 @@ def _configure_transport_security(server: FastMCP) -> None:
 
 @asynccontextmanager
 async def _lifespan(_server: FastMCP):
-    base_url, token = _load_settings()
+    base_url, token, oauth_config = _load_settings()
     client = MealieClient(base_url=base_url, api_token=token)
     try:
-        yield AppContext(client=client)
+        yield AppContext(client=client, oauth_config=oauth_config)
     finally:
         await client.aclose()
 
@@ -66,8 +96,24 @@ def _summarize_recipe(recipe: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _app_context(ctx: Context) -> AppContext:
+    return ctx.request_context.lifespan_context
+
+
 def _client(ctx: Context) -> MealieClient:
-    return ctx.request_context.lifespan_context.client
+    return _app_context(ctx).client
+
+
+def _require_oauth(ctx: Context) -> None:
+    """Raise an error if OAuth is required but token is missing/invalid."""
+    app = _app_context(ctx)
+    if app.oauth_config is not None:
+        token_info = verify_oauth_token(ctx)
+        if token_info is None:
+            raise RuntimeError(
+                "Authorization required. This MCP server requires OAuth authentication. "
+                "Please authorize via your MCP client's auth flow."
+            )
 
 
 def _section_title(line: str) -> str | None:
@@ -140,6 +186,95 @@ def build_server() -> FastMCP:
         lifespan=_lifespan,
     )
 
+    # OAuth well-known endpoints (MCP spec)
+    @mcp.get("/.well-known/oauth-protected-resource")
+    async def oauth_protected_resource(ctx: Context) -> JSONResponse:
+        """Advertise that this is an OAuth-protected resource."""
+        app = _app_context(ctx)
+        if app.oauth_config is None:
+            return JSONResponse({"error": "OAuth not configured"}, status_code=404)
+
+        return JSONResponse(
+            {
+                "resource_server": {
+                    "issuer": app.oauth_config.issuer_url,
+                    "authorization_servers": [
+                        urljoin(app.oauth_config.issuer_url, "/application/o/")
+                    ],
+                }
+            }
+        )
+
+    @mcp.get("/.well-known/oauth-authorization-server")
+    async def oauth_authorization_server(ctx: Context) -> JSONResponse:
+        """Return OIDC discovery document or redirect to issuer's discovery."""
+        app = _app_context(ctx)
+        if app.oauth_config is None:
+            return JSONResponse({"error": "OAuth not configured"}, status_code=404)
+
+        try:
+            config = await app.oauth_config.get_well_known_config()
+            return JSONResponse(config)
+        except Exception as e:
+            logger.error(f"Failed to fetch OIDC config: {e}")
+            return JSONResponse({"error": "Failed to fetch OAuth config"}, status_code=500)
+
+    @mcp.get("/oauth/authorize")
+    async def oauth_authorize(ctx: Context) -> RedirectResponse:
+        """Initiate OAuth authorization flow."""
+        app = _app_context(ctx)
+        if app.oauth_config is None:
+            return JSONResponse({"error": "OAuth not configured"}, status_code=404)
+
+        state = secrets.token_urlsafe(32)
+        auth_url = app.oauth_config.get_authorization_url(state)
+        return RedirectResponse(url=auth_url)
+
+    @mcp.get("/oauth/callback")
+    async def oauth_callback(request: Request) -> JSONResponse:
+        """Handle OAuth callback from authorization server."""
+        ctx = request.scope.get("app_context")
+        if ctx is None:
+            return JSONResponse({"error": "Server context not available"}, status_code=500)
+
+        app = ctx
+        if app.oauth_config is None:
+            return JSONResponse({"error": "OAuth not configured"}, status_code=404)
+
+        code = request.query_params.get("code")
+        state = request.query_params.get("state")
+        error = request.query_params.get("error")
+
+        if error:
+            return JSONResponse(
+                {"error": f"Authorization failed: {error}"},
+                status_code=400,
+            )
+
+        if not code or not state:
+            return JSONResponse({"error": "Missing code or state"}, status_code=400)
+
+        try:
+            token_response = await app.oauth_config.exchange_code_for_token(code)
+            access_token = token_response.get("access_token")
+            if not access_token:
+                raise ValueError("No access_token in response")
+
+            app.oauth_sessions[state] = access_token
+            return JSONResponse(
+                {
+                    "status": "success",
+                    "message": "Authorization successful. Return this to your MCP client.",
+                    "access_token": access_token,
+                }
+            )
+        except Exception as e:
+            logger.error(f"Token exchange failed: {e}")
+            return JSONResponse(
+                {"error": f"Token exchange failed: {e}"},
+                status_code=500,
+            )
+
     @mcp.tool()
     async def search_recipes(
         ctx: Context,
@@ -154,6 +289,7 @@ def build_server() -> FastMCP:
             tags: Optional list of tag slugs to filter by.
             limit: Maximum number of recipes to return (default 25, max 100).
         """
+        _require_oauth(ctx)
         per_page = max(1, min(limit, 100))
         try:
             payload = await _client(ctx).search_recipes(
@@ -167,6 +303,7 @@ def build_server() -> FastMCP:
     @mcp.tool()
     async def get_recipe(ctx: Context, slug: str) -> dict[str, Any]:
         """Fetch the full recipe JSON for a given slug."""
+        _require_oauth(ctx)
         try:
             return await _client(ctx).get_recipe(slug)
         except MealieError as exc:
@@ -182,6 +319,7 @@ def build_server() -> FastMCP:
             start_date: ISO date string, e.g. "2026-04-24".
             end_date: ISO date string, e.g. "2026-05-01".
         """
+        _require_oauth(ctx)
         try:
             payload = await _client(ctx).list_meal_plan(start_date, end_date)
         except MealieError as exc:
@@ -192,6 +330,7 @@ def build_server() -> FastMCP:
     @mcp.tool()
     async def list_shopping_lists(ctx: Context) -> list[dict[str, Any]]:
         """Return the IDs and names of all shopping lists."""
+        _require_oauth(ctx)
         try:
             payload = await _client(ctx).list_shopping_lists()
         except MealieError as exc:
@@ -213,6 +352,7 @@ def build_server() -> FastMCP:
             list_id: The shopping list ID (UUID) returned by list_shopping_lists.
             items: List of free-text item descriptions, e.g. ["2 lbs chicken thighs"].
         """
+        _require_oauth(ctx)
         added: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         client = _client(ctx)
@@ -263,6 +403,7 @@ def build_server() -> FastMCP:
             instructions: Ordered steps; "### Base" style lines become sections.
             notes: Free-text recipe notes (one entry per note).
         """
+        _require_oauth(ctx)
         client = _client(ctx)
         try:
             slug = await client.create_recipe(name)
@@ -323,6 +464,7 @@ def build_server() -> FastMCP:
             instructions: Ordered steps; "### Base" style lines become sections.
             notes: Free-text recipe notes (one entry per note).
         """
+        _require_oauth(ctx)
         patch = _build_recipe_patch(
             name=name,
             description=description,
@@ -363,6 +505,7 @@ def build_server() -> FastMCP:
             recipe_slug: Optional slug of an existing recipe to schedule.
             title: Optional free-text title (used when no recipe is linked).
         """
+        _require_oauth(ctx)
         if not recipe_slug and not title:
             raise ValueError("Provide either recipe_slug or title")
 
