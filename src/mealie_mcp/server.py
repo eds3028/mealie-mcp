@@ -12,6 +12,7 @@ from typing import Any, Literal
 from urllib.parse import urljoin
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse
 
@@ -150,6 +151,9 @@ def _build_recipe_patch(
     ingredients: list[str] | None = None,
     instructions: list[str] | None = None,
     notes: list[str] | None = None,
+    tag_objects: list[dict[str, Any]] | None = None,
+    category_objects: list[dict[str, Any]] | None = None,
+    tool_objects: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     patch: dict[str, Any] = {}
     if name is not None:
@@ -172,6 +176,12 @@ def _build_recipe_patch(
         patch["recipeInstructions"] = [_instruction_from_line(line) for line in instructions]
     if notes is not None:
         patch["notes"] = [{"title": "", "text": text} for text in notes]
+    if tag_objects is not None:
+        patch["tags"] = tag_objects
+    if category_objects is not None:
+        patch["recipeCategory"] = category_objects
+    if tool_objects is not None:
+        patch["tools"] = tool_objects
     return patch
 
 
@@ -373,6 +383,9 @@ def build_server() -> FastMCP:
         ingredients: list[str] | None = None,
         instructions: list[str] | None = None,
         notes: list[str] | None = None,
+        tags: list[str] | None = None,
+        categories: list[str] | None = None,
+        tools: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a recipe fully populated with content in one call.
 
@@ -395,12 +408,36 @@ def build_server() -> FastMCP:
             ingredients: Ingredient lines; "### Base" style lines become sections.
             instructions: Ordered steps; "### Base" style lines become sections.
             notes: Free-text recipe notes (one entry per note).
+            tags: Tag names to apply. Tags are created in Mealie if they don't exist.
+            categories: Category names to apply. Categories are created if they don't exist.
+            tools: Tool/equipment names to apply. Tools are created if they don't exist.
         """
         client = _client(ctx)
         try:
             slug = await client.create_recipe(name)
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
+
+        tag_objects: list[dict[str, Any]] | None = None
+        if tags is not None:
+            try:
+                tag_objects = [await client.get_or_create_tag(t) for t in tags]
+            except MealieError as exc:
+                raise RuntimeError(f"Failed to resolve tags: {exc}") from exc
+
+        category_objects: list[dict[str, Any]] | None = None
+        if categories is not None:
+            try:
+                category_objects = [await client.get_or_create_category(c) for c in categories]
+            except MealieError as exc:
+                raise RuntimeError(f"Failed to resolve categories: {exc}") from exc
+
+        tool_objects: list[dict[str, Any]] | None = None
+        if tools is not None:
+            try:
+                tool_objects = [await client.get_or_create_recipe_tool(t) for t in tools]
+            except MealieError as exc:
+                raise RuntimeError(f"Failed to resolve tools: {exc}") from exc
 
         patch = _build_recipe_patch(
             description=description,
@@ -412,6 +449,9 @@ def build_server() -> FastMCP:
             ingredients=ingredients,
             instructions=instructions,
             notes=notes,
+            tag_objects=tag_objects,
+            category_objects=category_objects,
+            tool_objects=tool_objects,
         )
         if not patch:
             return {"slug": slug, "name": name}
@@ -436,6 +476,9 @@ def build_server() -> FastMCP:
         ingredients: list[str] | None = None,
         instructions: list[str] | None = None,
         notes: list[str] | None = None,
+        tags: list[str] | None = None,
+        categories: list[str] | None = None,
+        tools: list[str] | None = None,
     ) -> dict[str, Any]:
         """Update fields on an existing recipe. Only provided fields are changed.
 
@@ -455,7 +498,33 @@ def build_server() -> FastMCP:
             ingredients: Ingredient lines; "### Base" style lines become sections.
             instructions: Ordered steps; "### Base" style lines become sections.
             notes: Free-text recipe notes (one entry per note).
+            tags: Tag names to apply (replaces existing tags). Tags are created if they don't exist.
+            categories: Category names to apply (replaces existing). Categories are created if they don't exist.
+            tools: Tool/equipment names to apply (replaces existing). Tools are created if they don't exist.
         """
+        client = _client(ctx)
+
+        tag_objects: list[dict[str, Any]] | None = None
+        if tags is not None:
+            try:
+                tag_objects = [await client.get_or_create_tag(t) for t in tags]
+            except MealieError as exc:
+                raise RuntimeError(f"Failed to resolve tags: {exc}") from exc
+
+        category_objects: list[dict[str, Any]] | None = None
+        if categories is not None:
+            try:
+                category_objects = [await client.get_or_create_category(c) for c in categories]
+            except MealieError as exc:
+                raise RuntimeError(f"Failed to resolve categories: {exc}") from exc
+
+        tool_objects: list[dict[str, Any]] | None = None
+        if tools is not None:
+            try:
+                tool_objects = [await client.get_or_create_recipe_tool(t) for t in tools]
+            except MealieError as exc:
+                raise RuntimeError(f"Failed to resolve tools: {exc}") from exc
+
         patch = _build_recipe_patch(
             name=name,
             description=description,
@@ -467,15 +536,109 @@ def build_server() -> FastMCP:
             ingredients=ingredients,
             instructions=instructions,
             notes=notes,
+            tag_objects=tag_objects,
+            category_objects=category_objects,
+            tool_objects=tool_objects,
         )
         if not patch:
             raise ValueError("Provide at least one field to update")
 
         try:
-            updated = await _client(ctx).update_recipe(slug, patch)
+            updated = await client.update_recipe(slug, patch)
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
         return _summarize_recipe(updated) if isinstance(updated, dict) else {"slug": slug}
+
+    @mcp.tool()
+    async def list_tags(ctx: Context) -> list[dict[str, Any]]:
+        """List all tags available in Mealie."""
+        try:
+            payload = await _client(ctx).list_tags()
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        items = payload.get("items") if isinstance(payload, dict) else payload
+        return [
+            {"id": t.get("id"), "name": t.get("name"), "slug": t.get("slug")}
+            for t in (items or [])
+            if isinstance(t, dict)
+        ]
+
+    @mcp.tool()
+    async def set_recipe_tags(
+        ctx: Context,
+        slug: str,
+        tags: list[str],
+    ) -> dict[str, Any]:
+        """Replace all tags on a recipe with the provided list.
+
+        Tags that don't already exist in Mealie are created automatically.
+
+        Args:
+            slug: Recipe slug returned by ``search_recipes`` or ``create_recipe``.
+            tags: Tag names to apply. Pass an empty list to clear all tags.
+        """
+        client = _client(ctx)
+        try:
+            tag_objects = [await client.get_or_create_tag(t) for t in tags]
+            updated = await client.update_recipe(slug, {"tags": tag_objects})
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return _summarize_recipe(updated) if isinstance(updated, dict) else {"slug": slug}
+
+    @mcp.tool()
+    async def set_recipe_image_from_url(
+        ctx: Context,
+        slug: str,
+        url: str,
+    ) -> dict[str, Any]:
+        """Upload an image for a recipe by downloading it from a URL.
+
+        The image replaces any previously set recipe image.
+
+        Args:
+            slug: Recipe slug returned by ``search_recipes`` or ``create_recipe``.
+            url: Publicly accessible URL of the image (JPEG, PNG, GIF, or WebP).
+        """
+        try:
+            await _client(ctx).upload_recipe_image_from_url(slug, url)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return {"slug": slug, "status": "image updated"}
+
+    @mcp.tool()
+    async def set_recipe_image_from_base64(
+        ctx: Context,
+        slug: str,
+        image_data: str,
+        content_type: str = "image/jpeg",
+    ) -> dict[str, Any]:
+        """Upload an AI-generated or locally produced image to a recipe using base64-encoded data.
+
+        Use this when you have raw image bytes encoded as a base64 string (e.g. from an
+        image-generation API). The image replaces any previously set recipe image.
+
+        Args:
+            slug: Recipe slug returned by ``search_recipes`` or ``create_recipe``.
+            image_data: Base64-encoded image bytes (standard or URL-safe encoding, with or
+                without a ``data:<mime>;base64,`` prefix).
+            content_type: MIME type of the image, e.g. "image/png", "image/jpeg",
+                "image/webp". Defaults to "image/jpeg".
+        """
+        # Strip data-URI prefix if present (data:image/png;base64,<data>)
+        if "," in image_data:
+            header, image_data = image_data.split(",", 1)
+            if not content_type or content_type == "image/jpeg":
+                # Try to extract MIME type from the data-URI header
+                try:
+                    content_type = header.split(":")[1].split(";")[0].strip()
+                except (IndexError, AttributeError):
+                    pass
+
+        try:
+            await _client(ctx).upload_recipe_image_from_base64(slug, image_data, content_type)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return {"slug": slug, "status": "image updated"}
 
     @mcp.tool()
     async def create_meal_plan_entry(
@@ -517,6 +680,229 @@ def build_server() -> FastMCP:
                 recipe_id=recipe_id,
                 title=title,
             )
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    @mcp.tool()
+    async def import_recipe_from_url(ctx: Context, url: str) -> dict[str, Any]:
+        """Scrape and import a recipe from an external URL into Mealie.
+
+        Args:
+            url: Publicly accessible URL of the recipe page to scrape.
+        """
+        try:
+            return await _client(ctx).import_recipe_from_url(url)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    @mcp.tool(annotations=ToolAnnotations(destructive=True))
+    async def delete_recipe(ctx: Context, slug: str) -> dict[str, Any]:
+        """Permanently delete a recipe from Mealie.
+
+        Args:
+            slug: Recipe slug returned by ``search_recipes`` or ``create_recipe``.
+        """
+        try:
+            await _client(ctx).delete_recipe(slug)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return {"slug": slug, "status": "deleted"}
+
+    @mcp.tool()
+    async def list_categories(ctx: Context) -> list[dict[str, Any]]:
+        """List all recipe categories available in Mealie."""
+        try:
+            payload = await _client(ctx).list_categories()
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        items = payload.get("items") if isinstance(payload, dict) else payload
+        return [
+            {"id": c.get("id"), "name": c.get("name"), "slug": c.get("slug")}
+            for c in (items or [])
+            if isinstance(c, dict)
+        ]
+
+    @mcp.tool()
+    async def set_recipe_categories(
+        ctx: Context,
+        slug: str,
+        categories: list[str],
+    ) -> dict[str, Any]:
+        """Replace all categories on a recipe with the provided list.
+
+        Categories that don't already exist in Mealie are created automatically.
+
+        Args:
+            slug: Recipe slug returned by ``search_recipes`` or ``create_recipe``.
+            categories: Category names to apply. Pass an empty list to clear all categories.
+        """
+        client = _client(ctx)
+        try:
+            category_objects = [await client.get_or_create_category(c) for c in categories]
+            updated = await client.update_recipe(slug, {"recipeCategory": category_objects})
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return _summarize_recipe(updated) if isinstance(updated, dict) else {"slug": slug}
+
+    @mcp.tool()
+    async def get_todays_meal_plan(ctx: Context) -> list[dict[str, Any]]:
+        """Return today's meal plan entries."""
+        try:
+            return await _client(ctx).get_todays_meal_plan()
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    @mcp.tool(annotations=ToolAnnotations(destructive=True))
+    async def delete_meal_plan_entry(ctx: Context, entry_id: str) -> dict[str, Any]:
+        """Delete a meal plan entry by its ID.
+
+        Args:
+            entry_id: The meal plan entry ID returned by ``list_meal_plan`` or ``create_meal_plan_entry``.
+        """
+        try:
+            await _client(ctx).delete_meal_plan_entry(entry_id)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return {"id": entry_id, "status": "deleted"}
+
+    @mcp.tool()
+    async def create_shopping_list(ctx: Context, name: str) -> dict[str, Any]:
+        """Create a new shopping list.
+
+        Args:
+            name: Display name for the new shopping list.
+        """
+        try:
+            return await _client(ctx).create_shopping_list(name)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    @mcp.tool()
+    async def list_shopping_list_items(ctx: Context, list_id: str) -> list[dict[str, Any]]:
+        """Return all items in a shopping list.
+
+        Args:
+            list_id: The shopping list ID (UUID) returned by ``list_shopping_lists``.
+        """
+        try:
+            payload = await _client(ctx).list_shopping_list_items(list_id)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        items = payload.get("items") if isinstance(payload, dict) else payload
+        return items or []
+
+    @mcp.tool()
+    async def check_off_shopping_item(
+        ctx: Context, item_id: str, checked: bool = True
+    ) -> dict[str, Any]:
+        """Mark a shopping list item as checked or unchecked.
+
+        Args:
+            item_id: The shopping list item ID.
+            checked: True to mark as checked/done, False to uncheck.
+        """
+        try:
+            return await _client(ctx).check_off_shopping_item(item_id, checked=checked)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    @mcp.tool(annotations=ToolAnnotations(destructive=True))
+    async def delete_shopping_list_item(ctx: Context, item_id: str) -> dict[str, Any]:
+        """Permanently delete an item from a shopping list.
+
+        Args:
+            item_id: The shopping list item ID to delete.
+        """
+        try:
+            await _client(ctx).delete_shopping_list_item(item_id)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return {"id": item_id, "status": "deleted"}
+
+    @mcp.tool()
+    async def list_foods(
+        ctx: Context, query: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """List foods/ingredients known to Mealie.
+
+        Args:
+            query: Optional search string to filter foods by name.
+            limit: Maximum number of foods to return (default 50).
+        """
+        per_page = max(1, min(limit, 1000))
+        try:
+            payload = await _client(ctx).list_foods(query=query, per_page=per_page)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        items = payload.get("items") if isinstance(payload, dict) else payload
+        return items or []
+
+    @mcp.tool()
+    async def list_recipe_tools(ctx: Context) -> list[dict[str, Any]]:
+        """List all recipe tools/equipment available in Mealie."""
+        try:
+            payload = await _client(ctx).list_recipe_tools()
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        items = payload.get("items") if isinstance(payload, dict) else payload
+        return [
+            {"id": t.get("id"), "name": t.get("name"), "slug": t.get("slug")}
+            for t in (items or [])
+            if isinstance(t, dict)
+        ]
+
+    @mcp.tool()
+    async def set_recipe_tools(
+        ctx: Context,
+        slug: str,
+        tools: list[str],
+    ) -> dict[str, Any]:
+        """Replace all tools/equipment on a recipe with the provided list.
+
+        Tools that don't already exist in Mealie are created automatically.
+
+        Args:
+            slug: Recipe slug returned by ``search_recipes`` or ``create_recipe``.
+            tools: Tool/equipment names to apply. Pass an empty list to clear all tools.
+        """
+        client = _client(ctx)
+        try:
+            tool_objects = [await client.get_or_create_recipe_tool(t) for t in tools]
+            updated = await client.update_recipe(slug, {"tools": tool_objects})
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return _summarize_recipe(updated) if isinstance(updated, dict) else {"slug": slug}
+
+    @mcp.tool()
+    async def list_cookbooks(ctx: Context) -> list[dict[str, Any]]:
+        """List all cookbooks in the household."""
+        try:
+            payload = await _client(ctx).list_cookbooks()
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        items = payload.get("items") if isinstance(payload, dict) else payload
+        return [
+            {"id": cb.get("id"), "name": cb.get("name"), "slug": cb.get("slug")}
+            for cb in (items or [])
+            if isinstance(cb, dict)
+        ]
+
+    @mcp.tool()
+    async def create_cookbook(
+        ctx: Context,
+        name: str,
+        description: str = "",
+        public: bool = False,
+    ) -> dict[str, Any]:
+        """Create a new cookbook.
+
+        Args:
+            name: Display name for the cookbook.
+            description: Optional description.
+            public: Whether the cookbook is publicly visible.
+        """
+        try:
+            return await _client(ctx).create_cookbook(name, description=description, public=public)
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
 
