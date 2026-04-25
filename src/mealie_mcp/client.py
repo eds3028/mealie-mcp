@@ -169,18 +169,10 @@ class MealieClient:
 
     # ---- Images ------------------------------------------------------------------
 
-    async def upload_recipe_image_from_url(self, slug: str, url: str) -> Any:
-        """Download an image from *url* and upload it to the recipe."""
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl:
-            resp = await dl.get(url)
-            if resp.status_code >= 400:
-                raise MealieError(resp.status_code, f"Failed to download image from {url}")
-            content = resp.content
-            content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+    _EXT_MAP = {"image/png": "png", "image/gif": "gif", "image/webp": "webp"}
 
-        ext_map = {"image/png": "png", "image/gif": "gif", "image/webp": "webp"}
-        ext = ext_map.get(content_type, "jpg")
-
+    async def _upload_recipe_image(self, slug: str, content: bytes, content_type: str) -> Any:
+        ext = self._EXT_MAP.get(content_type, "jpg")
         response = await self._client.put(
             f"/api/recipes/{slug}/image",
             files={"image": (f"image.{ext}", content, content_type)},
@@ -197,6 +189,27 @@ class MealieClient:
         if response.status_code == 204 or not response.content:
             return None
         return response.json()
+
+    async def upload_recipe_image_from_url(self, slug: str, url: str) -> Any:
+        """Download an image from *url* and upload it to the recipe."""
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl:
+            resp = await dl.get(url)
+            if resp.status_code >= 400:
+                raise MealieError(resp.status_code, f"Failed to download image from {url}")
+            content = resp.content
+            content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+        return await self._upload_recipe_image(slug, content, content_type)
+
+    async def upload_recipe_image_from_base64(
+        self, slug: str, b64_data: str, content_type: str
+    ) -> Any:
+        """Decode a base64 image string and upload it to the recipe."""
+        import base64
+        try:
+            content = base64.b64decode(b64_data)
+        except Exception as exc:
+            raise MealieError(400, f"Invalid base64 data: {exc}") from exc
+        return await self._upload_recipe_image(slug, content, content_type)
 
     # ---- Shopping lists ----------------------------------------------------------
 

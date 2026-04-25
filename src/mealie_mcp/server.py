@@ -559,6 +559,41 @@ def build_server() -> FastMCP:
         return {"slug": slug, "status": "image updated"}
 
     @mcp.tool()
+    async def set_recipe_image_from_base64(
+        ctx: Context,
+        slug: str,
+        image_data: str,
+        content_type: str = "image/jpeg",
+    ) -> dict[str, Any]:
+        """Upload an AI-generated or locally produced image to a recipe using base64-encoded data.
+
+        Use this when you have raw image bytes encoded as a base64 string (e.g. from an
+        image-generation API). The image replaces any previously set recipe image.
+
+        Args:
+            slug: Recipe slug returned by ``search_recipes`` or ``create_recipe``.
+            image_data: Base64-encoded image bytes (standard or URL-safe encoding, with or
+                without a ``data:<mime>;base64,`` prefix).
+            content_type: MIME type of the image, e.g. "image/png", "image/jpeg",
+                "image/webp". Defaults to "image/jpeg".
+        """
+        # Strip data-URI prefix if present (data:image/png;base64,<data>)
+        if "," in image_data:
+            header, image_data = image_data.split(",", 1)
+            if not content_type or content_type == "image/jpeg":
+                # Try to extract MIME type from the data-URI header
+                try:
+                    content_type = header.split(":")[1].split(";")[0].strip()
+                except (IndexError, AttributeError):
+                    pass
+
+        try:
+            await _client(ctx).upload_recipe_image_from_base64(slug, image_data, content_type)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return {"slug": slug, "status": "image updated"}
+
+    @mcp.tool()
     async def create_meal_plan_entry(
         ctx: Context,
         date: str,
