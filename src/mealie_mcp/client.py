@@ -150,6 +150,54 @@ class MealieClient:
             body["text"] = text
         return await self._request("POST", "/api/households/mealplans", json=body)
 
+    # ---- Tags --------------------------------------------------------------------
+
+    async def list_tags(self, *, per_page: int = 1000) -> dict[str, Any]:
+        return await self._request("GET", "/api/organizers/tags", params={"perPage": per_page})
+
+    async def create_tag(self, name: str) -> dict[str, Any]:
+        return await self._request("POST", "/api/organizers/tags", json={"name": name})
+
+    async def get_or_create_tag(self, name: str) -> dict[str, Any]:
+        """Return existing tag by name (case-insensitive) or create it."""
+        result = await self.list_tags()
+        items = result.get("items") if isinstance(result, dict) else result
+        for tag in (items or []):
+            if isinstance(tag, dict) and tag.get("name", "").lower() == name.lower():
+                return tag
+        return await self.create_tag(name)
+
+    # ---- Images ------------------------------------------------------------------
+
+    async def upload_recipe_image_from_url(self, slug: str, url: str) -> Any:
+        """Download an image from *url* and upload it to the recipe."""
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl:
+            resp = await dl.get(url)
+            if resp.status_code >= 400:
+                raise MealieError(resp.status_code, f"Failed to download image from {url}")
+            content = resp.content
+            content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+
+        ext_map = {"image/png": "png", "image/gif": "gif", "image/webp": "webp"}
+        ext = ext_map.get(content_type, "jpg")
+
+        response = await self._client.put(
+            f"/api/recipes/{slug}/image",
+            files={"image": (f"image.{ext}", content, content_type)},
+            data={"extension": ext},
+        )
+        if response.status_code >= 400:
+            try:
+                payload = response.json()
+                detail = payload.get("detail") if isinstance(payload, dict) else payload
+            except ValueError:
+                payload = response.text
+                detail = response.text
+            raise MealieError(response.status_code, str(detail), payload)
+        if response.status_code == 204 or not response.content:
+            return None
+        return response.json()
+
     # ---- Shopping lists ----------------------------------------------------------
 
     async def list_shopping_lists(self) -> dict[str, Any]:

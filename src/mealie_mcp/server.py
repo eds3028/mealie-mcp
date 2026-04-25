@@ -150,6 +150,7 @@ def _build_recipe_patch(
     ingredients: list[str] | None = None,
     instructions: list[str] | None = None,
     notes: list[str] | None = None,
+    tag_objects: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     patch: dict[str, Any] = {}
     if name is not None:
@@ -172,6 +173,8 @@ def _build_recipe_patch(
         patch["recipeInstructions"] = [_instruction_from_line(line) for line in instructions]
     if notes is not None:
         patch["notes"] = [{"title": "", "text": text} for text in notes]
+    if tag_objects is not None:
+        patch["tags"] = tag_objects
     return patch
 
 
@@ -373,6 +376,7 @@ def build_server() -> FastMCP:
         ingredients: list[str] | None = None,
         instructions: list[str] | None = None,
         notes: list[str] | None = None,
+        tags: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a recipe fully populated with content in one call.
 
@@ -395,12 +399,20 @@ def build_server() -> FastMCP:
             ingredients: Ingredient lines; "### Base" style lines become sections.
             instructions: Ordered steps; "### Base" style lines become sections.
             notes: Free-text recipe notes (one entry per note).
+            tags: Tag names to apply. Tags are created in Mealie if they don't exist.
         """
         client = _client(ctx)
         try:
             slug = await client.create_recipe(name)
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
+
+        tag_objects: list[dict[str, Any]] | None = None
+        if tags is not None:
+            try:
+                tag_objects = [await client.get_or_create_tag(t) for t in tags]
+            except MealieError as exc:
+                raise RuntimeError(f"Failed to resolve tags: {exc}") from exc
 
         patch = _build_recipe_patch(
             description=description,
@@ -412,6 +424,7 @@ def build_server() -> FastMCP:
             ingredients=ingredients,
             instructions=instructions,
             notes=notes,
+            tag_objects=tag_objects,
         )
         if not patch:
             return {"slug": slug, "name": name}
@@ -436,6 +449,7 @@ def build_server() -> FastMCP:
         ingredients: list[str] | None = None,
         instructions: list[str] | None = None,
         notes: list[str] | None = None,
+        tags: list[str] | None = None,
     ) -> dict[str, Any]:
         """Update fields on an existing recipe. Only provided fields are changed.
 
@@ -455,7 +469,17 @@ def build_server() -> FastMCP:
             ingredients: Ingredient lines; "### Base" style lines become sections.
             instructions: Ordered steps; "### Base" style lines become sections.
             notes: Free-text recipe notes (one entry per note).
+            tags: Tag names to apply (replaces existing tags). Tags are created if they don't exist.
         """
+        client = _client(ctx)
+
+        tag_objects: list[dict[str, Any]] | None = None
+        if tags is not None:
+            try:
+                tag_objects = [await client.get_or_create_tag(t) for t in tags]
+            except MealieError as exc:
+                raise RuntimeError(f"Failed to resolve tags: {exc}") from exc
+
         patch = _build_recipe_patch(
             name=name,
             description=description,
@@ -467,15 +491,72 @@ def build_server() -> FastMCP:
             ingredients=ingredients,
             instructions=instructions,
             notes=notes,
+            tag_objects=tag_objects,
         )
         if not patch:
             raise ValueError("Provide at least one field to update")
 
         try:
-            updated = await _client(ctx).update_recipe(slug, patch)
+            updated = await client.update_recipe(slug, patch)
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
         return _summarize_recipe(updated) if isinstance(updated, dict) else {"slug": slug}
+
+    @mcp.tool()
+    async def list_tags(ctx: Context) -> list[dict[str, Any]]:
+        """List all tags available in Mealie."""
+        try:
+            payload = await _client(ctx).list_tags()
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        items = payload.get("items") if isinstance(payload, dict) else payload
+        return [
+            {"id": t.get("id"), "name": t.get("name"), "slug": t.get("slug")}
+            for t in (items or [])
+            if isinstance(t, dict)
+        ]
+
+    @mcp.tool()
+    async def set_recipe_tags(
+        ctx: Context,
+        slug: str,
+        tags: list[str],
+    ) -> dict[str, Any]:
+        """Replace all tags on a recipe with the provided list.
+
+        Tags that don't already exist in Mealie are created automatically.
+
+        Args:
+            slug: Recipe slug returned by ``search_recipes`` or ``create_recipe``.
+            tags: Tag names to apply. Pass an empty list to clear all tags.
+        """
+        client = _client(ctx)
+        try:
+            tag_objects = [await client.get_or_create_tag(t) for t in tags]
+            updated = await client.update_recipe(slug, {"tags": tag_objects})
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return _summarize_recipe(updated) if isinstance(updated, dict) else {"slug": slug}
+
+    @mcp.tool()
+    async def set_recipe_image_from_url(
+        ctx: Context,
+        slug: str,
+        url: str,
+    ) -> dict[str, Any]:
+        """Upload an image for a recipe by downloading it from a URL.
+
+        The image replaces any previously set recipe image.
+
+        Args:
+            slug: Recipe slug returned by ``search_recipes`` or ``create_recipe``.
+            url: Publicly accessible URL of the image (JPEG, PNG, GIF, or WebP).
+        """
+        try:
+            await _client(ctx).upload_recipe_image_from_url(slug, url)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return {"slug": slug, "status": "image updated"}
 
     @mcp.tool()
     async def create_meal_plan_entry(
