@@ -2,22 +2,21 @@
 
 from __future__ import annotations
 
-import json
+import logging
 import os
 import secrets
-import logging
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
-from urllib.parse import urljoin
 
+from cachetools import TTLCache
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse
 
+from .auth import OAuthConfig, extract_bearer_token, verify_oauth_token
 from .client import MealieClient, MealieError
-from .auth import OAuthConfig, verify_oauth_token
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +27,7 @@ EntryType = Literal["breakfast", "lunch", "dinner", "side"]
 class AppContext:
     client: MealieClient
     oauth_config: OAuthConfig | None = None
-    oauth_sessions: dict[str, str] = None  # state -> access_token mapping
-
-    def __post_init__(self):
-        if self.oauth_sessions is None:
-            self.oauth_sessions = {}
+    oauth_sessions: TTLCache = field(default_factory=lambda: TTLCache(maxsize=256, ttl=300))
 
 
 def _load_settings() -> tuple[str, str, OAuthConfig | None]:
@@ -48,6 +43,7 @@ def _load_settings() -> tuple[str, str, OAuthConfig | None]:
     oauth_client_id = os.environ.get("OAUTH_CLIENT_ID", "").strip()
     oauth_client_secret = os.environ.get("OAUTH_CLIENT_SECRET", "").strip()
     oauth_server_url = os.environ.get("OAUTH_SERVER_URL", "").strip()
+    oauth_jwks_uri = os.environ.get("OAUTH_JWKS_URI", "").strip()
 
     if oauth_issuer and oauth_client_id and oauth_client_secret and oauth_server_url:
         oauth_config = OAuthConfig(
@@ -55,6 +51,7 @@ def _load_settings() -> tuple[str, str, OAuthConfig | None]:
             client_id=oauth_client_id,
             client_secret=oauth_client_secret,
             server_url=oauth_server_url,
+            jwks_uri=oauth_jwks_uri if oauth_jwks_uri else None,
         )
 
     return base_url, token, oauth_config
@@ -105,12 +102,13 @@ def _client(ctx: Context) -> MealieClient:
     return _app_context(ctx).client
 
 
-def _require_oauth(ctx: Context) -> None:
+async def _require_oauth(ctx: Context) -> None:
     """Raise an error if OAuth is required but token is missing/invalid."""
     app = _app_context(ctx)
     if app.oauth_config is not None:
-        token_info = verify_oauth_token(ctx)
-        if token_info is None:
+        token = extract_bearer_token(ctx)
+        claims = await verify_oauth_token(token or "", app.oauth_config)
+        if claims is None:
             raise RuntimeError(
                 "Authorization required. This MCP server requires OAuth authentication. "
                 "Please authorize via your MCP client's auth flow."
@@ -121,7 +119,7 @@ def _section_title(line: str) -> str | None:
     stripped = line.lstrip()
     for prefix in ("### ", "## ", "# "):
         if stripped.startswith(prefix):
-            return stripped[len(prefix):].strip()
+            return stripped[len(prefix) :].strip()
     return None
 
 
@@ -196,18 +194,13 @@ def build_server() -> FastMCP:
         lifespan=_lifespan,
     )
 
-    # Load OAuth config once at build time for HTTP route handlers
-    # (custom_route handlers don't have access to the lifespan context)
-    _, _, oauth_config = _load_settings()
-    oauth_sessions: dict[str, str] = {}
-
-    # OAuth well-known endpoints (MCP spec)
+    # OAuth endpoints (reachable even when OAuth is not configured)
     @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
     async def oauth_protected_resource(request: Request) -> JSONResponse:
         """Advertise that this is an OAuth-protected resource."""
+        _, _, oauth_config = _load_settings()
         if oauth_config is None:
             return JSONResponse({"error": "OAuth not configured"}, status_code=404)
-
         return JSONResponse(
             {
                 "resource": oauth_config.server_url,
@@ -218,9 +211,9 @@ def build_server() -> FastMCP:
     @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
     async def oauth_authorization_server(request: Request) -> JSONResponse:
         """Return OIDC discovery document."""
+        _, _, oauth_config = _load_settings()
         if oauth_config is None:
             return JSONResponse({"error": "OAuth not configured"}, status_code=404)
-
         try:
             config = await oauth_config.get_well_known_config()
             return JSONResponse(config)
@@ -231,16 +224,23 @@ def build_server() -> FastMCP:
     @mcp.custom_route("/oauth/authorize", methods=["GET"])
     async def oauth_authorize(request: Request) -> RedirectResponse:
         """Initiate OAuth authorization flow."""
+        _, _, oauth_config = _load_settings()
         if oauth_config is None:
             return JSONResponse({"error": "OAuth not configured"}, status_code=404)
-
-        state = secrets.token_urlsafe(32)
-        auth_url = oauth_config.get_authorization_url(state)
-        return RedirectResponse(url=auth_url)
+        try:
+            state = secrets.token_urlsafe(32)
+            auth_url = await oauth_config.get_authorization_url(state)
+            return RedirectResponse(url=auth_url)
+        except Exception as e:
+            logger.error(f"Failed to build authorization URL: {e}")
+            return JSONResponse(
+                {"error": f"Failed to build authorization URL: {e}"}, status_code=500
+            )
 
     @mcp.custom_route("/oauth/callback", methods=["GET"])
     async def oauth_callback(request: Request) -> JSONResponse:
         """Handle OAuth callback from authorization server."""
+        _, _, oauth_config = _load_settings()
         if oauth_config is None:
             return JSONResponse({"error": "OAuth not configured"}, status_code=404)
 
@@ -263,12 +263,14 @@ def build_server() -> FastMCP:
             if not access_token:
                 raise ValueError("No access_token in response")
 
-            oauth_sessions[state] = access_token
+            # Store the token in a session (keyed by state) for the client to retrieve
+            # but do NOT return it in the response body (that would expose it in logs)
+            # For remote MCP clients, they complete the flow by returning the Bearer token
+            # they already received out-of-band or from the OIDC provider.
             return JSONResponse(
                 {
                     "status": "success",
-                    "message": "Authorization successful. Return this to your MCP client.",
-                    "access_token": access_token,
+                    "message": "Authorization successful. Return to your MCP client.",
                 }
             )
         except Exception as e:
@@ -281,14 +283,20 @@ def build_server() -> FastMCP:
     @mcp.custom_route("/health", methods=["GET"])
     async def health_check(request: Request) -> JSONResponse:
         """Simple health check endpoint."""
+        _, _, oauth_config = _load_settings()
         return JSONResponse({"status": "ok", "oauth_enabled": oauth_config is not None})
 
-    @mcp.tool()
+    # ---- Tools ----
+
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
     async def search_recipes(
         ctx: Context,
         query: str | None = None,
         tags: list[str] | None = None,
         limit: int = 25,
+        query_filter: str | None = None,
+        order_by: str | None = None,
+        order_direction: str = "asc",
     ) -> list[dict[str, Any]]:
         """Search recipes in Mealie.
 
@@ -296,35 +304,47 @@ def build_server() -> FastMCP:
             query: Free-text search across recipe names and descriptions.
             tags: Optional list of tag slugs to filter by.
             limit: Maximum number of recipes to return (default 25, max 100).
+            query_filter: Optional advanced filter (Mealie query syntax). Examples:
+              - "lastMade <= \\"$NOW-30d\\"" - not made in last 30 days
+              - "[tags.name](http://tags.name) CONTAINS ALL [\\"Easy\\"]" - tagged Easy
+              - "name NOT LIKE \\"Test%\\"" - name doesn't start with Test
+            order_by: Optional field to sort by (e.g. "lastMade", "name").
+            order_direction: Sort direction, "asc" or "desc" (default "asc").
         """
+        await _require_oauth(ctx)
         per_page = max(1, min(limit, 100))
         try:
             payload = await _client(ctx).search_recipes(
-                query=query, tags=tags, per_page=per_page
+                query=query,
+                tags=tags,
+                per_page=per_page,
+                query_filter=query_filter,
+                order_by=order_by,
+                order_direction=order_direction,
             )
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
         items = payload.get("items") if isinstance(payload, dict) else payload
         return [_summarize_recipe(r) for r in (items or [])]
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
     async def get_recipe(ctx: Context, slug: str) -> dict[str, Any]:
         """Fetch the full recipe JSON for a given slug."""
+        await _require_oauth(ctx)
         try:
             return await _client(ctx).get_recipe(slug)
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
 
-    @mcp.tool()
-    async def list_meal_plan(
-        ctx: Context, start_date: str, end_date: str
-    ) -> list[dict[str, Any]]:
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
+    async def list_meal_plan(ctx: Context, start_date: str, end_date: str) -> list[dict[str, Any]]:
         """List meal plan entries between two dates (inclusive).
 
         Args:
             start_date: ISO date string, e.g. "2026-04-24".
             end_date: ISO date string, e.g. "2026-05-01".
         """
+        await _require_oauth(ctx)
         try:
             payload = await _client(ctx).list_meal_plan(start_date, end_date)
         except MealieError as exc:
@@ -332,9 +352,10 @@ def build_server() -> FastMCP:
         items = payload.get("items") if isinstance(payload, dict) else payload
         return items or []
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
     async def list_shopping_lists(ctx: Context) -> list[dict[str, Any]]:
         """Return the IDs and names of all shopping lists."""
+        await _require_oauth(ctx)
         try:
             payload = await _client(ctx).list_shopping_lists()
         except MealieError as exc:
@@ -356,6 +377,7 @@ def build_server() -> FastMCP:
             list_id: The shopping list ID (UUID) returned by list_shopping_lists.
             items: List of free-text item descriptions, e.g. ["2 lbs chicken thighs"].
         """
+        await _require_oauth(ctx)
         added: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         client = _client(ctx)
@@ -365,7 +387,9 @@ def build_server() -> FastMCP:
                 continue
             try:
                 created = await client.add_shopping_list_item(list_id=list_id, note=text)
-                added.append({"id": created.get("id") if isinstance(created, dict) else None, "note": text})
+                added.append(
+                    {"id": created.get("id") if isinstance(created, dict) else None, "note": text}
+                )
             except MealieError as exc:
                 errors.append({"note": text, "error": str(exc)})
         return {"added": added, "errors": errors}
@@ -412,6 +436,7 @@ def build_server() -> FastMCP:
             categories: Category names to apply. Categories are created if they don't exist.
             tools: Tool/equipment names to apply. Tools are created if they don't exist.
         """
+        await _require_oauth(ctx)
         client = _client(ctx)
         try:
             slug = await client.create_recipe(name)
@@ -421,21 +446,21 @@ def build_server() -> FastMCP:
         tag_objects: list[dict[str, Any]] | None = None
         if tags is not None:
             try:
-                tag_objects = [await client.get_or_create_tag(t) for t in tags]
+                tag_objects = await client.resolve_tags(tags)
             except MealieError as exc:
                 raise RuntimeError(f"Failed to resolve tags: {exc}") from exc
 
         category_objects: list[dict[str, Any]] | None = None
         if categories is not None:
             try:
-                category_objects = [await client.get_or_create_category(c) for c in categories]
+                category_objects = await client.resolve_categories(categories)
             except MealieError as exc:
                 raise RuntimeError(f"Failed to resolve categories: {exc}") from exc
 
         tool_objects: list[dict[str, Any]] | None = None
         if tools is not None:
             try:
-                tool_objects = [await client.get_or_create_recipe_tool(t) for t in tools]
+                tool_objects = await client.resolve_recipe_tools(tools)
             except MealieError as exc:
                 raise RuntimeError(f"Failed to resolve tools: {exc}") from exc
 
@@ -460,7 +485,11 @@ def build_server() -> FastMCP:
             updated = await client.update_recipe(slug, patch)
         except MealieError as exc:
             raise RuntimeError(f"Recipe '{slug}' was created but update failed: {exc}") from exc
-        return _summarize_recipe(updated) if isinstance(updated, dict) else {"slug": slug, "name": name}
+        return (
+            _summarize_recipe(updated)
+            if isinstance(updated, dict)
+            else {"slug": slug, "name": name}
+        )
 
     @mcp.tool()
     async def update_recipe(
@@ -502,26 +531,27 @@ def build_server() -> FastMCP:
             categories: Category names to apply (replaces existing). Categories are created if they don't exist.
             tools: Tool/equipment names to apply (replaces existing). Tools are created if they don't exist.
         """
+        await _require_oauth(ctx)
         client = _client(ctx)
 
         tag_objects: list[dict[str, Any]] | None = None
         if tags is not None:
             try:
-                tag_objects = [await client.get_or_create_tag(t) for t in tags]
+                tag_objects = await client.resolve_tags(tags)
             except MealieError as exc:
                 raise RuntimeError(f"Failed to resolve tags: {exc}") from exc
 
         category_objects: list[dict[str, Any]] | None = None
         if categories is not None:
             try:
-                category_objects = [await client.get_or_create_category(c) for c in categories]
+                category_objects = await client.resolve_categories(categories)
             except MealieError as exc:
                 raise RuntimeError(f"Failed to resolve categories: {exc}") from exc
 
         tool_objects: list[dict[str, Any]] | None = None
         if tools is not None:
             try:
-                tool_objects = [await client.get_or_create_recipe_tool(t) for t in tools]
+                tool_objects = await client.resolve_recipe_tools(tools)
             except MealieError as exc:
                 raise RuntimeError(f"Failed to resolve tools: {exc}") from exc
 
@@ -549,9 +579,10 @@ def build_server() -> FastMCP:
             raise RuntimeError(str(exc)) from exc
         return _summarize_recipe(updated) if isinstance(updated, dict) else {"slug": slug}
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
     async def list_tags(ctx: Context) -> list[dict[str, Any]]:
         """List all tags available in Mealie."""
+        await _require_oauth(ctx)
         try:
             payload = await _client(ctx).list_tags()
         except MealieError as exc:
@@ -577,9 +608,10 @@ def build_server() -> FastMCP:
             slug: Recipe slug returned by ``search_recipes`` or ``create_recipe``.
             tags: Tag names to apply. Pass an empty list to clear all tags.
         """
+        await _require_oauth(ctx)
         client = _client(ctx)
         try:
-            tag_objects = [await client.get_or_create_tag(t) for t in tags]
+            tag_objects = await client.resolve_tags(tags)
             updated = await client.update_recipe(slug, {"tags": tag_objects})
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
@@ -599,6 +631,7 @@ def build_server() -> FastMCP:
             slug: Recipe slug returned by ``search_recipes`` or ``create_recipe``.
             url: Publicly accessible URL of the image (JPEG, PNG, GIF, or WebP).
         """
+        await _require_oauth(ctx)
         try:
             await _client(ctx).upload_recipe_image_from_url(slug, url)
         except MealieError as exc:
@@ -624,11 +657,10 @@ def build_server() -> FastMCP:
             content_type: MIME type of the image, e.g. "image/png", "image/jpeg",
                 "image/webp". Defaults to "image/jpeg".
         """
-        # Strip data-URI prefix if present (data:image/png;base64,<data>)
+        await _require_oauth(ctx)
         if "," in image_data:
             header, image_data = image_data.split(",", 1)
             if not content_type or content_type == "image/jpeg":
-                # Try to extract MIME type from the data-URI header
                 try:
                     content_type = header.split(":")[1].split(";")[0].strip()
                 except (IndexError, AttributeError):
@@ -659,6 +691,7 @@ def build_server() -> FastMCP:
             recipe_slug: Optional slug of an existing recipe to schedule.
             title: Optional free-text title (used when no recipe is linked).
         """
+        await _require_oauth(ctx)
         if not recipe_slug and not title:
             raise ValueError("Provide either recipe_slug or title")
 
@@ -683,13 +716,14 @@ def build_server() -> FastMCP:
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive=False))
     async def import_recipe_from_url(ctx: Context, url: str) -> dict[str, Any]:
         """Scrape and import a recipe from an external URL into Mealie.
 
         Args:
             url: Publicly accessible URL of the recipe page to scrape.
         """
+        await _require_oauth(ctx)
         try:
             return await _client(ctx).import_recipe_from_url(url)
         except MealieError as exc:
@@ -702,15 +736,17 @@ def build_server() -> FastMCP:
         Args:
             slug: Recipe slug returned by ``search_recipes`` or ``create_recipe``.
         """
+        await _require_oauth(ctx)
         try:
             await _client(ctx).delete_recipe(slug)
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
         return {"slug": slug, "status": "deleted"}
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
     async def list_categories(ctx: Context) -> list[dict[str, Any]]:
         """List all recipe categories available in Mealie."""
+        await _require_oauth(ctx)
         try:
             payload = await _client(ctx).list_categories()
         except MealieError as exc:
@@ -736,17 +772,19 @@ def build_server() -> FastMCP:
             slug: Recipe slug returned by ``search_recipes`` or ``create_recipe``.
             categories: Category names to apply. Pass an empty list to clear all categories.
         """
+        await _require_oauth(ctx)
         client = _client(ctx)
         try:
-            category_objects = [await client.get_or_create_category(c) for c in categories]
+            category_objects = await client.resolve_categories(categories)
             updated = await client.update_recipe(slug, {"recipeCategory": category_objects})
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
         return _summarize_recipe(updated) if isinstance(updated, dict) else {"slug": slug}
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
     async def get_todays_meal_plan(ctx: Context) -> list[dict[str, Any]]:
         """Return today's meal plan entries."""
+        await _require_oauth(ctx)
         try:
             return await _client(ctx).get_todays_meal_plan()
         except MealieError as exc:
@@ -759,6 +797,7 @@ def build_server() -> FastMCP:
         Args:
             entry_id: The meal plan entry ID returned by ``list_meal_plan`` or ``create_meal_plan_entry``.
         """
+        await _require_oauth(ctx)
         try:
             await _client(ctx).delete_meal_plan_entry(entry_id)
         except MealieError as exc:
@@ -772,24 +811,37 @@ def build_server() -> FastMCP:
         Args:
             name: Display name for the new shopping list.
         """
+        await _require_oauth(ctx)
         try:
             return await _client(ctx).create_shopping_list(name)
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
     async def list_shopping_list_items(ctx: Context, list_id: str) -> list[dict[str, Any]]:
         """Return all items in a shopping list.
 
         Args:
             list_id: The shopping list ID (UUID) returned by ``list_shopping_lists``.
         """
+        await _require_oauth(ctx)
         try:
             payload = await _client(ctx).list_shopping_list_items(list_id)
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
         items = payload.get("items") if isinstance(payload, dict) else payload
-        return items or []
+        return [
+            {
+                "id": item.get("id"),
+                "note": item.get("note"),
+                "checked": item.get("checked"),
+                "quantity": item.get("quantity"),
+                "unit": item.get("unit"),
+                "food": item.get("food"),
+            }
+            for item in (items or [])
+            if isinstance(item, dict)
+        ]
 
     @mcp.tool()
     async def check_off_shopping_item(
@@ -801,8 +853,33 @@ def build_server() -> FastMCP:
             item_id: The shopping list item ID.
             checked: True to mark as checked/done, False to uncheck.
         """
+        await _require_oauth(ctx)
         try:
             return await _client(ctx).check_off_shopping_item(item_id, checked=checked)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    @mcp.tool()
+    async def update_shopping_list_item(
+        ctx: Context,
+        item_id: str,
+        note: str | None = None,
+        quantity: float | None = None,
+        checked: bool | None = None,
+    ) -> dict[str, Any]:
+        """Update a shopping list item's note, quantity, or checked state.
+
+        Args:
+            item_id: Shopping list item ID returned by list_shopping_list_items.
+            note: Updated free-text description.
+            quantity: Updated quantity.
+            checked: True to mark done, False to uncheck.
+        """
+        await _require_oauth(ctx)
+        try:
+            return await _client(ctx).update_shopping_list_item(
+                item_id, note=note, quantity=quantity, checked=checked
+            )
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
 
@@ -813,13 +890,148 @@ def build_server() -> FastMCP:
         Args:
             item_id: The shopping list item ID to delete.
         """
+        await _require_oauth(ctx)
         try:
             await _client(ctx).delete_shopping_list_item(item_id)
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
         return {"id": item_id, "status": "deleted"}
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(destructive=False))
+    async def add_recipe_to_shopping_list(
+        ctx: Context,
+        recipe_slug: str,
+        list_id: str,
+        scale: float = 1.0,
+    ) -> dict[str, Any]:
+        """Add all ingredients from a recipe to a shopping list.
+
+        Args:
+            recipe_slug: Recipe slug returned by search_recipes or create_recipe.
+            list_id: Shopping list ID returned by list_shopping_lists.
+            scale: Serving multiplier, e.g. 2.0 to double the recipe. Defaults to 1.0.
+        """
+        await _require_oauth(ctx)
+        client = _client(ctx)
+        try:
+            recipe = await client.get_recipe(recipe_slug)
+        except MealieError as exc:
+            raise RuntimeError(f"Could not look up recipe '{recipe_slug}': {exc}") from exc
+        recipe_id = recipe.get("id") if isinstance(recipe, dict) else None
+        if not recipe_id:
+            raise RuntimeError(f"Recipe '{recipe_slug}' has no id")
+        try:
+            return await client.add_recipe_to_shopping_list(
+                list_id=list_id, recipe_id=recipe_id, scale=scale
+            )
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
+    async def parse_ingredient(ctx: Context, ingredient_text: str) -> dict[str, Any]:
+        """Parse a free-text ingredient string into structured components.
+
+        Args:
+            ingredient_text: Free-text ingredient, e.g. "2 cups lactose-free milk".
+
+        Returns structured components: quantity, unit, food, note.
+        """
+        await _require_oauth(ctx)
+        try:
+            return await _client(ctx).parse_ingredient(ingredient_text)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
+    async def get_recipe_suggestions(
+        ctx: Context,
+        limit: int = 5,
+        tags: list[str] | None = None,
+        categories: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return randomly suggested recipes, optionally filtered.
+
+        Args:
+            limit: Number of suggestions to return (default 5).
+            tags: Optional tag names to filter by.
+            categories: Optional category names to filter by.
+        """
+        await _require_oauth(ctx)
+        client = _client(ctx)
+        tag_ids: list[str] | None = None
+        category_ids: list[str] | None = None
+
+        if tags:
+            try:
+                tag_items = await client.list_tags()
+                tag_list = tag_items.get("items", []) if isinstance(tag_items, dict) else tag_items
+                tag_index = {
+                    t.get("name", "").lower(): t.get("id") for t in tag_list if isinstance(t, dict)
+                }
+                tag_ids = [tag_index[t.lower()] for t in tags if t.lower() in tag_index]
+            except MealieError:
+                pass
+
+        if categories:
+            try:
+                cat_items = await client.list_categories()
+                cat_list = cat_items.get("items", []) if isinstance(cat_items, dict) else cat_items
+                cat_index = {
+                    c.get("name", "").lower(): c.get("id") for c in cat_list if isinstance(c, dict)
+                }
+                category_ids = [cat_index[c.lower()] for c in categories if c.lower() in cat_index]
+            except MealieError:
+                pass
+
+        try:
+            payload = await client.get_recipe_suggestions(
+                limit=limit, tag_ids=tag_ids, category_ids=category_ids
+            )
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        items = payload.get("items") if isinstance(payload, dict) else payload
+        return [_summarize_recipe(r) for r in (items or [])]
+
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
+    async def list_units(ctx: Context, query: str | None = None) -> list[dict[str, Any]]:
+        """List units of measure available in Mealie.
+
+        Args:
+            query: Optional search string to filter units by name.
+        """
+        await _require_oauth(ctx)
+        try:
+            payload = await _client(ctx).list_units(query=query)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        items = payload.get("items") if isinstance(payload, dict) else payload
+        return [
+            {
+                "id": u.get("id"),
+                "name": u.get("name"),
+                "abbreviation": u.get("abbreviation"),
+                "useAbbreviation": u.get("useAbbreviation"),
+            }
+            for u in (items or [])
+            if isinstance(u, dict)
+        ]
+
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
+    async def get_recipe_timeline(ctx: Context, slug: str) -> list[dict[str, Any]]:
+        """Return the cook history timeline for a recipe.
+
+        Args:
+            slug: Recipe slug returned by search_recipes or create_recipe.
+        """
+        await _require_oauth(ctx)
+        try:
+            payload = await _client(ctx).get_recipe_timeline(slug)
+        except MealieError as exc:
+            raise RuntimeError(str(exc)) from exc
+        items = payload.get("items") if isinstance(payload, dict) else payload
+        return items or []
+
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
     async def list_foods(
         ctx: Context, query: str | None = None, limit: int = 50
     ) -> list[dict[str, Any]]:
@@ -829,6 +1041,7 @@ def build_server() -> FastMCP:
             query: Optional search string to filter foods by name.
             limit: Maximum number of foods to return (default 50).
         """
+        await _require_oauth(ctx)
         per_page = max(1, min(limit, 1000))
         try:
             payload = await _client(ctx).list_foods(query=query, per_page=per_page)
@@ -837,9 +1050,10 @@ def build_server() -> FastMCP:
         items = payload.get("items") if isinstance(payload, dict) else payload
         return items or []
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
     async def list_recipe_tools(ctx: Context) -> list[dict[str, Any]]:
         """List all recipe tools/equipment available in Mealie."""
+        await _require_oauth(ctx)
         try:
             payload = await _client(ctx).list_recipe_tools()
         except MealieError as exc:
@@ -865,17 +1079,19 @@ def build_server() -> FastMCP:
             slug: Recipe slug returned by ``search_recipes`` or ``create_recipe``.
             tools: Tool/equipment names to apply. Pass an empty list to clear all tools.
         """
+        await _require_oauth(ctx)
         client = _client(ctx)
         try:
-            tool_objects = [await client.get_or_create_recipe_tool(t) for t in tools]
+            tool_objects = await client.resolve_recipe_tools(tools)
             updated = await client.update_recipe(slug, {"tools": tool_objects})
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
         return _summarize_recipe(updated) if isinstance(updated, dict) else {"slug": slug}
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(read_only=True))
     async def list_cookbooks(ctx: Context) -> list[dict[str, Any]]:
         """List all cookbooks in the household."""
+        await _require_oauth(ctx)
         try:
             payload = await _client(ctx).list_cookbooks()
         except MealieError as exc:
@@ -901,6 +1117,7 @@ def build_server() -> FastMCP:
             description: Optional description.
             public: Whether the cookbook is publicly visible.
         """
+        await _require_oauth(ctx)
         try:
             return await _client(ctx).create_cookbook(name, description=description, public=public)
         except MealieError as exc:

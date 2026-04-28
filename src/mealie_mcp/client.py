@@ -90,12 +90,18 @@ class MealieClient:
         tags: list[str] | None = None,
         per_page: int = 25,
         page: int = 1,
+        query_filter: str | None = None,
+        order_by: str | None = None,
+        order_direction: str | None = None,
     ) -> dict[str, Any]:
         """Search recipes. ``tags`` are matched by slug."""
         params: dict[str, Any] = {
             "search": query,
             "perPage": per_page,
             "page": page,
+            "queryFilter": query_filter,
+            "orderBy": order_by,
+            "orderDirection": order_direction,
         }
         if tags:
             params["tags"] = tags
@@ -123,7 +129,9 @@ class MealieClient:
         merged = {**current, **patch}
         return await self._request("PUT", f"/api/recipes/{slug}", json=merged)
 
-    async def import_recipe_from_url(self, url: str, *, include_tags: bool = True) -> dict[str, Any]:
+    async def import_recipe_from_url(
+        self, url: str, *, include_tags: bool = True
+    ) -> dict[str, Any]:
         """Scrape a recipe from an external URL and save it to Mealie."""
         result = await self._request(
             "POST", "/api/recipes/create/url", json={"url": url, "includeTags": include_tags}
@@ -184,15 +192,34 @@ class MealieClient:
         """Return existing tag by name (case-insensitive) or create it."""
         result = await self.list_tags()
         items = result.get("items") if isinstance(result, dict) else result
-        for tag in (items or []):
+        for tag in items or []:
             if isinstance(tag, dict) and tag.get("name", "").lower() == name.lower():
                 return tag
         return await self.create_tag(name)
 
+    async def resolve_tags(self, names: list[str]) -> list[dict[str, Any]]:
+        """Resolve a list of tag names to tag objects, fetching the index once."""
+        result = await self.list_tags()
+        items = result.get("items") if isinstance(result, dict) else result
+        index = {t.get("name", "").lower(): t for t in (items or []) if isinstance(t, dict)}
+        resolved: list[dict[str, Any]] = []
+        for name in names:
+            existing = index.get(name.lower())
+            if existing is not None:
+                resolved.append(existing)
+            else:
+                created = await self.create_tag(name)
+                resolved.append(created)
+                if isinstance(created, dict):
+                    index[created.get("name", name).lower()] = created
+        return resolved
+
     # ---- Organizers: Categories --------------------------------------------------
 
     async def list_categories(self, *, per_page: int = 1000) -> dict[str, Any]:
-        return await self._request("GET", "/api/organizers/categories", params={"perPage": per_page})
+        return await self._request(
+            "GET", "/api/organizers/categories", params={"perPage": per_page}
+        )
 
     async def create_category(self, name: str) -> dict[str, Any]:
         return await self._request("POST", "/api/organizers/categories", json={"name": name})
@@ -201,10 +228,27 @@ class MealieClient:
         """Return existing category by name (case-insensitive) or create it."""
         result = await self.list_categories()
         items = result.get("items") if isinstance(result, dict) else result
-        for cat in (items or []):
+        for cat in items or []:
             if isinstance(cat, dict) and cat.get("name", "").lower() == name.lower():
                 return cat
         return await self.create_category(name)
+
+    async def resolve_categories(self, names: list[str]) -> list[dict[str, Any]]:
+        """Resolve a list of category names to category objects, fetching the index once."""
+        result = await self.list_categories()
+        items = result.get("items") if isinstance(result, dict) else result
+        index = {c.get("name", "").lower(): c for c in (items or []) if isinstance(c, dict)}
+        resolved: list[dict[str, Any]] = []
+        for name in names:
+            existing = index.get(name.lower())
+            if existing is not None:
+                resolved.append(existing)
+            else:
+                created = await self.create_category(name)
+                resolved.append(created)
+                if isinstance(created, dict):
+                    index[created.get("name", name).lower()] = created
+        return resolved
 
     # ---- Organizers: Tools (equipment) ------------------------------------------
 
@@ -218,10 +262,27 @@ class MealieClient:
         """Return existing tool by name (case-insensitive) or create it."""
         result = await self.list_recipe_tools()
         items = result.get("items") if isinstance(result, dict) else result
-        for tool in (items or []):
+        for tool in items or []:
             if isinstance(tool, dict) and tool.get("name", "").lower() == name.lower():
                 return tool
         return await self.create_recipe_tool(name)
+
+    async def resolve_recipe_tools(self, names: list[str]) -> list[dict[str, Any]]:
+        """Resolve a list of tool names to tool objects, fetching the index once."""
+        result = await self.list_recipe_tools()
+        items = result.get("items") if isinstance(result, dict) else result
+        index = {t.get("name", "").lower(): t for t in (items or []) if isinstance(t, dict)}
+        resolved: list[dict[str, Any]] = []
+        for name in names:
+            existing = index.get(name.lower())
+            if existing is not None:
+                resolved.append(existing)
+            else:
+                created = await self.create_recipe_tool(name)
+                resolved.append(created)
+                if isinstance(created, dict):
+                    index[created.get("name", name).lower()] = created
+        return resolved
 
     # ---- Images ------------------------------------------------------------------
 
@@ -261,6 +322,7 @@ class MealieClient:
     ) -> Any:
         """Decode a base64 image string and upload it to the recipe."""
         import base64
+
         try:
             content = base64.b64decode(b64_data)
         except Exception as exc:
@@ -295,7 +357,9 @@ class MealieClient:
         body = {"shoppingListId": list_id, "note": note, "isFood": False, "checked": False}
         return await self._request("POST", "/api/households/shopping/items", json=body)
 
-    async def check_off_shopping_item(self, item_id: str, *, checked: bool = True) -> dict[str, Any]:
+    async def check_off_shopping_item(
+        self, item_id: str, *, checked: bool = True
+    ) -> dict[str, Any]:
         """Toggle the checked state of a shopping list item."""
         current = await self._request("GET", f"/api/households/shopping/items/{item_id}")
         if not isinstance(current, dict):
@@ -308,6 +372,86 @@ class MealieClient:
 
     async def delete_shopping_list_item(self, item_id: str) -> None:
         await self._request("DELETE", f"/api/households/shopping/items/{item_id}")
+
+    async def add_recipe_to_shopping_list(
+        self, *, list_id: str, recipe_id: str, scale: float = 1.0
+    ) -> dict[str, Any]:
+        """Add all ingredients from a recipe to a shopping list."""
+        return await self._request(
+            "POST",
+            f"/api/households/shopping/lists/{list_id}/recipe/{recipe_id}",
+            json={"recipeIncrementQuantity": scale},
+        )
+
+    async def update_shopping_list_item(
+        self,
+        item_id: str,
+        *,
+        note: str | None = None,
+        quantity: float | None = None,
+        checked: bool | None = None,
+    ) -> dict[str, Any]:
+        """Fetch the item, merge provided fields, and PUT the result back."""
+        current = await self._request("GET", f"/api/households/shopping/items/{item_id}")
+        if not isinstance(current, dict):
+            raise MealieError(500, "Unexpected response fetching shopping item", current)
+        merged = dict(current)
+        if note is not None:
+            merged["note"] = note
+        if quantity is not None:
+            merged["quantity"] = quantity
+        if checked is not None:
+            merged["checked"] = checked
+        return await self._request(
+            "PUT",
+            f"/api/households/shopping/items/{item_id}",
+            json=merged,
+        )
+
+    # ---- Recipe extras (parsing, suggestions, timeline) -------------------------
+
+    async def parse_ingredient(self, ingredient_text: str) -> dict[str, Any]:
+        """Parse a free-text ingredient string into structured components."""
+        return await self._request(
+            "POST",
+            "/api/parser/ingredient",
+            json={"parser": "nlp", "ingredient": ingredient_text},
+        )
+
+    async def get_recipe_suggestions(
+        self,
+        *,
+        limit: int = 5,
+        tag_ids: list[str] | None = None,
+        category_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return randomly suggested recipes, optionally filtered by tags/categories."""
+        params: dict[str, Any] = {"limit": limit}
+        if tag_ids:
+            params["tags"] = tag_ids
+        if category_ids:
+            params["categories"] = category_ids
+        return await self._request("GET", "/api/recipes/suggestions", params=params)
+
+    async def get_recipe_timeline(self, slug: str) -> dict[str, Any]:
+        """Return the cook history timeline for a recipe."""
+        recipe = await self.get_recipe(slug)
+        recipe_id = recipe.get("id") if isinstance(recipe, dict) else None
+        if not recipe_id:
+            raise MealieError(404, f"Recipe '{slug}' has no id")
+        return await self._request(
+            "GET",
+            "/api/recipes/timeline/events",
+            params={"queryFilter": f'recipeId="{recipe_id}"', "perPage": 1000},
+        )
+
+    # ---- Units -------------------------------------------------------------------
+
+    async def list_units(self, *, query: str | None = None, per_page: int = 1000) -> dict[str, Any]:
+        params: dict[str, Any] = {"perPage": per_page}
+        if query:
+            params["search"] = query
+        return await self._request("GET", "/api/units", params=params)
 
     # ---- Foods -------------------------------------------------------------------
 

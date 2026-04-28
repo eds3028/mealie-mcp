@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mealie-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Model Context Protocol server for the Mealie self-hosted recipe manager"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,6 +27,9 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pydantic>=2.6.0",
     "starlette>=0.36.0",
+    "PyJWT>=2.8.0",
+    "cryptography>=42.0.0",
+    "cachetools>=5.3.0",
 ]
 
 [project.optional-dependencies]
