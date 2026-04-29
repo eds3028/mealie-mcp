@@ -299,6 +299,11 @@ def build_server() -> FastMCP:
         try:
             config = await oauth_config.get_well_known_config()
             config["issuer"] = _server_base_url
+            # Add "none" so PKCE public clients (e.g. ChatGPT) know they can
+            # exchange the auth code without sending a client_secret.
+            auth_methods = config.get("token_endpoint_auth_methods_supported", [])
+            if "none" not in auth_methods:
+                config["token_endpoint_auth_methods_supported"] = ["none"] + auth_methods
             return JSONResponse(config)
         except Exception as e:
             logger.error(f"Failed to fetch OIDC config: {e}")
