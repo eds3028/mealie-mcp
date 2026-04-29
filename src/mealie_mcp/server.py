@@ -9,7 +9,7 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 import httpx
 import uvicorn
@@ -300,10 +300,12 @@ def build_server() -> FastMCP:
         try:
             config = await oauth_config.get_well_known_config()
             config["issuer"] = _server_base_url
-            # Point token_endpoint at our proxy so we can inject the client_secret.
-            # ChatGPT (public PKCE client) never sends a client_secret itself.
+            # Route both OAuth endpoints through our server so we fully control
+            # the authorization_code redirect (strips Authentik's iss param that
+            # would mismatch our virtual issuer) and the token exchange (injects
+            # client_secret since ChatGPT is a PKCE public client).
+            config["authorization_endpoint"] = f"{_server_base_url}/oauth/authorize"
             config["token_endpoint"] = f"{_server_base_url}/oauth/token"
-            # Advertise "none" so ChatGPT knows it can omit the client_secret.
             auth_methods = config.get("token_endpoint_auth_methods_supported", [])
             if "none" not in auth_methods:
                 config["token_endpoint_auth_methods_supported"] = ["none"] + auth_methods
@@ -319,17 +321,43 @@ def build_server() -> FastMCP:
 
     @mcp.custom_route("/oauth/authorize", methods=["GET"])
     async def oauth_authorize(request: Request) -> RedirectResponse:
-        """Initiate OAuth authorization flow."""
+        """Relay ChatGPT's authorization request to Authentik.
+
+        We intercept the redirect_uri so Authentik sends the code to us rather
+        than directly to ChatGPT. This lets our callback strip Authentik's iss
+        response parameter (which would mismatch our virtual issuer) before
+        forwarding the code to ChatGPT's actual callback.
+        """
         if oauth_config is None:
             return JSONResponse({"error": "OAuth not configured"}, status_code=404)
 
-        state = secrets.token_urlsafe(32)
-        auth_url = oauth_config.get_authorization_url(state)
-        return RedirectResponse(url=auth_url)
+        params = dict(request.query_params)
+        state = params.get("state") or secrets.token_urlsafe(32)
+
+        # Remember where ChatGPT wants the code delivered.
+        client_redirect_uri = params.pop("redirect_uri", "")
+        oauth_sessions[state] = {"redirect_uri": client_redirect_uri}
+
+        # Authentik will redirect to us; we relay to ChatGPT from our callback.
+        params["redirect_uri"] = f"{_server_base_url}/oauth/callback"
+        params.setdefault("client_id", oauth_config.client_id)
+
+        try:
+            oidc = await oauth_config.get_well_known_config()
+            authentik_auth_url = oidc.get("authorization_endpoint", "")
+        except Exception as e:
+            logger.error(f"Failed to fetch OIDC config for authorize: {e}")
+            return JSONResponse({"error": "Failed to fetch OAuth config"}, status_code=500)
+
+        return RedirectResponse(url=f"{authentik_auth_url}?{urlencode(params)}")
 
     @mcp.custom_route("/oauth/callback", methods=["GET"])
-    async def oauth_callback(request: Request) -> JSONResponse:
-        """Handle OAuth callback from authorization server."""
+    async def oauth_callback(request: Request) -> RedirectResponse:
+        """Receive auth code from Authentik and relay it to ChatGPT's callback.
+
+        By relaying here we strip Authentik's iss response parameter so ChatGPT
+        doesn't see a mismatch against our virtual issuer.
+        """
         if oauth_config is None:
             return JSONResponse({"error": "OAuth not configured"}, status_code=404)
 
@@ -338,34 +366,22 @@ def build_server() -> FastMCP:
         error = request.query_params.get("error")
 
         if error:
-            return JSONResponse(
-                {"error": f"Authorization failed: {error}"},
-                status_code=400,
-            )
+            return JSONResponse({"error": f"Authorization failed: {error}"}, status_code=400)
 
         if not code or not state:
             return JSONResponse({"error": "Missing code or state"}, status_code=400)
 
-        try:
-            token_response = await oauth_config.exchange_code_for_token(code)
-            access_token = token_response.get("access_token")
-            if not access_token:
-                raise ValueError("No access_token in response")
+        session = oauth_sessions.get(state)
+        if not session or not isinstance(session, dict):
+            return JSONResponse({"error": "Unknown state parameter"}, status_code=400)
 
-            oauth_sessions[state] = access_token
-            return JSONResponse(
-                {
-                    "status": "success",
-                    "message": "Authorization successful. Return this to your MCP client.",
-                    "access_token": access_token,
-                }
-            )
-        except Exception as e:
-            logger.error(f"Token exchange failed: {e}")
-            return JSONResponse(
-                {"error": f"Token exchange failed: {e}"},
-                status_code=500,
-            )
+        client_redirect_uri = session.get("redirect_uri")
+        if not client_redirect_uri:
+            return JSONResponse({"error": "No redirect_uri stored for this state"}, status_code=400)
+
+        # Forward code + state to ChatGPT — deliberately omit iss to avoid
+        # the issuer mismatch that would cause ChatGPT to abort the flow.
+        return RedirectResponse(url=f"{client_redirect_uri}?{urlencode({'code': code, 'state': state})}")
 
     @mcp.custom_route("/oauth/token", methods=["POST"])
     async def oauth_token_proxy(request: Request) -> JSONResponse:
