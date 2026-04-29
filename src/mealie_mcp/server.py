@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
 
+import httpx
 import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
@@ -299,8 +300,10 @@ def build_server() -> FastMCP:
         try:
             config = await oauth_config.get_well_known_config()
             config["issuer"] = _server_base_url
-            # Add "none" so PKCE public clients (e.g. ChatGPT) know they can
-            # exchange the auth code without sending a client_secret.
+            # Point token_endpoint at our proxy so we can inject the client_secret.
+            # ChatGPT (public PKCE client) never sends a client_secret itself.
+            config["token_endpoint"] = f"{_server_base_url}/oauth/token"
+            # Advertise "none" so ChatGPT knows it can omit the client_secret.
             auth_methods = config.get("token_endpoint_auth_methods_supported", [])
             if "none" not in auth_methods:
                 config["token_endpoint_auth_methods_supported"] = ["none"] + auth_methods
@@ -363,6 +366,36 @@ def build_server() -> FastMCP:
                 {"error": f"Token exchange failed: {e}"},
                 status_code=500,
             )
+
+    @mcp.custom_route("/oauth/token", methods=["POST"])
+    async def oauth_token_proxy(request: Request) -> JSONResponse:
+        """Proxy token exchange to Authentik, injecting our client credentials.
+
+        ChatGPT is a PKCE public client and never sends a client_secret.
+        We receive the code here, add our server-side client_secret, and
+        forward to Authentik's real token endpoint.
+        """
+        if oauth_config is None:
+            return JSONResponse({"error": "OAuth not configured"}, status_code=404)
+
+        try:
+            form = await request.form()
+            payload = dict(form)
+            payload.setdefault("client_id", oauth_config.client_id)
+            if oauth_config.client_secret:
+                payload["client_secret"] = oauth_config.client_secret
+
+            oidc = await oauth_config.get_well_known_config()
+            upstream = oidc.get("token_endpoint")
+            if not upstream:
+                return JSONResponse({"error": "No token_endpoint in OIDC config"}, status_code=500)
+
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(upstream, data=payload, timeout=30.0)
+            return JSONResponse(resp.json(), status_code=resp.status_code)
+        except Exception as e:
+            logger.error(f"Token proxy failed: {e}")
+            return JSONResponse({"error": str(e)}, status_code=500)
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health_check(request: Request) -> JSONResponse:
