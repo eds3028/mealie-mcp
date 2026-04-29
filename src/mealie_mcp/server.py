@@ -218,23 +218,29 @@ class _ContentTypeFixMiddleware:
                 new_headers.append((b"accept", b"application/json, text/event-stream"))
             scope = {**scope, "headers": new_headers}
 
-            async def logging_receive() -> dict:
-                msg = await receive()
-                if msg.get("type") == "http.request":
-                    body = msg.get("body", b"")
-                    logger.warning(f"POST /mcp body ({len(body)} bytes): {body[:300]!r}")
-                return msg
+            # Peek at the body to detect empty-body probes from ChatGPT.
+            first_msg = await receive()
+            body = first_msg.get("body", b"")
+            more_body = first_msg.get("more_body", False)
 
-            async def logging_send(message: dict) -> None:
-                if message.get("type") == "http.response.start" and message.get("status", 0) >= 400:
-                    logger.warning(f"POST /mcp failed with status {message['status']}")
-                elif message.get("type") == "http.response.body":
-                    body = message.get("body", b"")
-                    if body:
-                        logger.warning(f"POST /mcp error body: {body.decode(errors='replace')[:500]}")
-                await send(message)
+            if not body and not more_body:
+                # Empty-body POST — ChatGPT probes the endpoint before starting
+                # the MCP handshake. Acknowledge so it proceeds.
+                await send({
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-type", b"application/json"), (b"content-length", b"2")],
+                })
+                await send({"type": "http.response.body", "body": b"{}", "more_body": False})
+                return
 
-            await self.app(scope, logging_receive, logging_send)
+            # Non-empty body: replay the peeked message then forward to FastMCP.
+            queued = [first_msg]
+
+            async def replay_receive() -> dict:
+                return queued.pop(0) if queued else await receive()
+
+            await self.app(scope, replay_receive, send)
         else:
             await self.app(scope, receive, send)
 
