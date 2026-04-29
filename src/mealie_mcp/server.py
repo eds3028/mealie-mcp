@@ -11,8 +11,10 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import urljoin
 
+import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
+from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse
 
@@ -183,6 +185,28 @@ def _build_recipe_patch(
     if tool_objects is not None:
         patch["tools"] = tool_objects
     return patch
+
+
+class _ContentTypeFixMiddleware:
+    """Rewrite application/octet-stream to application/json on POST /mcp.
+
+    ChatGPT's MCP client sends application/octet-stream but FastMCP's transport
+    security only accepts application/json, causing 400s on every tool call.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope.get("method") == "POST":
+            new_headers = [
+                (b"content-type", b"application/json")
+                if name == b"content-type" and value == b"application/octet-stream"
+                else (name, value)
+                for name, value in scope["headers"]
+            ]
+            scope = {**scope, "headers": new_headers}
+        await self.app(scope, receive, send)
 
 
 def build_server() -> FastMCP:
@@ -928,9 +952,11 @@ def run() -> None:
         _configure_transport_security(server)
 
         if transport in ("sse", "http"):
-            server.run(transport="sse")
+            asgi_app = server.sse_app()
         else:
-            server.run(transport="streamable-http")
+            asgi_app = server.streamable_http_app()
+
+        uvicorn.run(_ContentTypeFixMiddleware(asgi_app), host=host, port=port)
         return
 
     raise RuntimeError(
