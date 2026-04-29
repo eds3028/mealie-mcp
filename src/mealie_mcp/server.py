@@ -304,6 +304,11 @@ def build_server() -> FastMCP:
             logger.error(f"Failed to fetch OIDC config: {e}")
             return JSONResponse({"error": "Failed to fetch OAuth config"}, status_code=500)
 
+    @mcp.custom_route("/.well-known/openid-configuration", methods=["GET"])
+    async def openid_configuration(request: Request) -> JSONResponse:
+        """Alias of oauth-authorization-server for clients that prefer OIDC discovery."""
+        return await oauth_authorization_server(request)
+
     @mcp.custom_route("/oauth/authorize", methods=["GET"])
     async def oauth_authorize(request: Request) -> RedirectResponse:
         """Initiate OAuth authorization flow."""

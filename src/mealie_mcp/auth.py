@@ -34,7 +34,7 @@ class OAuthConfig:
         """Fetch OIDC discovery document."""
         async with httpx.AsyncClient() as client:
             resp = await client.get(
-                urljoin(self.issuer_url, ".well-known/openid-configuration"),
+                urljoin(self.issuer_url + "/", ".well-known/openid-configuration"),
                 timeout=10.0,
             )
             resp.raise_for_status()
