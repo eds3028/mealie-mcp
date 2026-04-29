@@ -9,7 +9,7 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
@@ -261,6 +261,15 @@ def build_server() -> FastMCP:
     _, _, oauth_config = _load_settings()
     oauth_sessions: dict[str, str] = {}
 
+    # Derive the base URL of this server (scheme + host, no path) from OAUTH_SERVER_URL.
+    # Used as the virtual authorization server so ChatGPT fetches OAuth metadata
+    # from our /.well-known/oauth-authorization-server instead of going directly
+    # to Authentik (which doesn't serve RFC 8414 at the application-specific path).
+    _server_base_url: str = ""
+    if oauth_config is not None:
+        parsed = urlparse(oauth_config.server_url)
+        _server_base_url = f"{parsed.scheme}://{parsed.netloc}"
+
     # OAuth well-known endpoints (MCP spec)
     @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
     async def oauth_protected_resource(request: Request) -> JSONResponse:
@@ -271,18 +280,25 @@ def build_server() -> FastMCP:
         return JSONResponse(
             {
                 "resource": oauth_config.server_url,
-                "authorization_servers": [oauth_config.issuer_url],
+                "authorization_servers": [_server_base_url],
             }
         )
 
     @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
     async def oauth_authorization_server(request: Request) -> JSONResponse:
-        """Return OIDC discovery document."""
+        """Proxy Authentik's OIDC config as RFC 8414 authorization server metadata.
+
+        ChatGPT requires /.well-known/oauth-authorization-server but Authentik only
+        serves /.well-known/openid-configuration at the application-specific path.
+        We proxy the OIDC config and override the issuer so it matches the URL
+        ChatGPT used to fetch this document.
+        """
         if oauth_config is None:
             return JSONResponse({"error": "OAuth not configured"}, status_code=404)
 
         try:
             config = await oauth_config.get_well_known_config()
+            config["issuer"] = _server_base_url
             return JSONResponse(config)
         except Exception as e:
             logger.error(f"Failed to fetch OIDC config: {e}")
