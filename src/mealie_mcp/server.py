@@ -218,6 +218,13 @@ class _ContentTypeFixMiddleware:
                 new_headers.append((b"accept", b"application/json, text/event-stream"))
             scope = {**scope, "headers": new_headers}
 
+            async def logging_receive() -> dict:
+                msg = await receive()
+                if msg.get("type") == "http.request":
+                    body = msg.get("body", b"")
+                    logger.warning(f"POST /mcp body ({len(body)} bytes): {body[:300]!r}")
+                return msg
+
             async def logging_send(message: dict) -> None:
                 if message.get("type") == "http.response.start" and message.get("status", 0) >= 400:
                     logger.warning(f"POST /mcp failed with status {message['status']}")
@@ -227,7 +234,7 @@ class _ContentTypeFixMiddleware:
                         logger.warning(f"POST /mcp error body: {body.decode(errors='replace')[:500]}")
                 await send(message)
 
-            await self.app(scope, receive, logging_send)
+            await self.app(scope, logging_receive, logging_send)
         else:
             await self.app(scope, receive, send)
 
