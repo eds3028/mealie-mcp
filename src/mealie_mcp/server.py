@@ -217,7 +217,19 @@ class _ContentTypeFixMiddleware:
             if not has_accept:
                 new_headers.append((b"accept", b"application/json, text/event-stream"))
             scope = {**scope, "headers": new_headers}
-        await self.app(scope, receive, send)
+
+            async def logging_send(message: dict) -> None:
+                if message.get("type") == "http.response.start" and message.get("status", 0) >= 400:
+                    logger.warning(f"POST /mcp failed with status {message['status']}")
+                elif message.get("type") == "http.response.body":
+                    body = message.get("body", b"")
+                    if body:
+                        logger.warning(f"POST /mcp error body: {body.decode(errors='replace')[:500]}")
+                await send(message)
+
+            await self.app(scope, receive, logging_send)
+        else:
+            await self.app(scope, receive, send)
 
 
 def build_server() -> FastMCP:
