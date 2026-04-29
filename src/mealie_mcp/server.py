@@ -199,12 +199,23 @@ class _ContentTypeFixMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and scope.get("method") == "POST":
-            new_headers = [
-                (b"content-type", b"application/json")
-                if name == b"content-type" and value == b"application/octet-stream"
-                else (name, value)
-                for name, value in scope["headers"]
-            ]
+            new_headers = []
+            has_accept = False
+            for name, value in scope["headers"]:
+                if name == b"content-type" and value == b"application/octet-stream":
+                    new_headers.append((b"content-type", b"application/json"))
+                elif name == b"accept":
+                    has_accept = True
+                    accept = value.decode()
+                    if "text/event-stream" not in accept:
+                        accept += ", text/event-stream"
+                    if "application/json" not in accept:
+                        accept += ", application/json"
+                    new_headers.append((b"accept", accept.encode()))
+                else:
+                    new_headers.append((name, value))
+            if not has_accept:
+                new_headers.append((b"accept", b"application/json, text/event-stream"))
             scope = {**scope, "headers": new_headers}
         await self.app(scope, receive, send)
 
