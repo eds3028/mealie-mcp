@@ -16,7 +16,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from .client import MealieClient, MealieError
-from .auth import OAuthConfig, verify_oauth_token
+from .auth import OAuthConfig, extract_bearer_token
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +27,6 @@ EntryType = Literal["breakfast", "lunch", "dinner", "side"]
 class AppContext:
     client: MealieClient
     oauth_config: OAuthConfig | None = None
-    oauth_sessions: dict[str, str] = None  # state -> access_token mapping
-
-    def __post_init__(self):
-        if self.oauth_sessions is None:
-            self.oauth_sessions = {}
 
 
 def _load_settings() -> tuple[str, str, OAuthConfig | None]:
@@ -45,15 +40,19 @@ def _load_settings() -> tuple[str, str, OAuthConfig | None]:
     oauth_config = None
     oauth_issuer = os.environ.get("OAUTH_ISSUER_URL", "").strip()
     oauth_client_id = os.environ.get("OAUTH_CLIENT_ID", "").strip()
-    oauth_client_secret = os.environ.get("OAUTH_CLIENT_SECRET", "").strip()
+    oauth_client_secret = os.environ.get("OAUTH_CLIENT_SECRET", "").strip() or None
     oauth_server_url = os.environ.get("OAUTH_SERVER_URL", "").strip()
 
-    if oauth_issuer and oauth_client_id and oauth_client_secret and oauth_server_url:
+    # Enable OAuth when issuer, client_id, and server_url are set. The secret
+    # is optional: ChatGPT uses PKCE and the MCP server no longer proxies the
+    # token exchange, so the secret is only meaningful if Authentik's provider
+    # is set to Confidential and the client passes it through itself.
+    if oauth_issuer and oauth_client_id and oauth_server_url:
         oauth_config = OAuthConfig(
             issuer_url=oauth_issuer,
             client_id=oauth_client_id,
-            client_secret=oauth_client_secret,
             server_url=oauth_server_url,
+            client_secret=oauth_client_secret,
         )
 
     return base_url, token, oauth_config
@@ -102,18 +101,6 @@ def _app_context(ctx: Context) -> AppContext:
 
 def _client(ctx: Context) -> MealieClient:
     return _app_context(ctx).client
-
-
-def _require_oauth(ctx: Context) -> None:
-    """Raise an error if OAuth is required but token is missing/invalid."""
-    app = _app_context(ctx)
-    if app.oauth_config is not None:
-        token_info = verify_oauth_token(ctx)
-        if token_info is None:
-            raise RuntimeError(
-                "Authorization required. This MCP server requires OAuth authentication. "
-                "Please authorize via your MCP client's auth flow."
-            )
 
 
 def _section_title(line: str) -> str | None:
@@ -182,6 +169,63 @@ def _build_recipe_patch(
     if tool_objects is not None:
         patch["tools"] = tool_objects
     return patch
+
+
+class _BearerAuthMiddleware:
+    """Enforce Bearer-token auth on MCP transport endpoints.
+
+    When OAuth is configured, requests to /mcp and /sse must carry a valid
+    JWT signed by the configured issuer. Unauthenticated requests get a 401
+    with a WWW-Authenticate header pointing at our protected-resource
+    metadata, which is what triggers the MCP client's discovery + auth flow
+    per the MCP authorization spec.
+
+    Health and well-known endpoints stay public so discovery works.
+    """
+
+    _PUBLIC_PREFIXES = ("/health", "/.well-known/")
+    _PROTECTED_PREFIXES = ("/mcp", "/sse", "/messages")
+
+    def __init__(self, app: ASGIApp, oauth_config: OAuthConfig | None) -> None:
+        self.app = app
+        self.oauth_config = oauth_config
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if self.oauth_config is None or scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if path.startswith(self._PUBLIC_PREFIXES) or not path.startswith(
+            self._PROTECTED_PREFIXES
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        token = extract_bearer_token(scope.get("headers", []))
+        claims = await self.oauth_config.verify_token(token) if token else None
+        if claims is None:
+            resource_metadata = (
+                f"{self.oauth_config.server_url}/.well-known/oauth-protected-resource"
+            )
+            challenge = (
+                f'Bearer realm="mealie-mcp", '
+                f'resource_metadata="{resource_metadata}"'
+            ).encode()
+            body = b'{"error":"unauthorized"}'
+            await send({
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"www-authenticate", challenge),
+                ],
+            })
+            await send({"type": "http.response.body", "body": body, "more_body": False})
+            return
+
+        await self.app(scope, receive, send)
 
 
 class _ContentTypeFixMiddleware:
@@ -922,7 +966,11 @@ def run() -> None:
         else:
             asgi_app = server.streamable_http_app()
 
-        uvicorn.run(_ContentTypeFixMiddleware(asgi_app), host=host, port=port)
+        _, _, oauth_config = _load_settings()
+        wrapped = _BearerAuthMiddleware(
+            _ContentTypeFixMiddleware(asgi_app), oauth_config=oauth_config
+        )
+        uvicorn.run(wrapped, host=host, port=port)
         return
 
     raise RuntimeError(

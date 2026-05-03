@@ -95,22 +95,53 @@ cp .env.example .env
 
 ### OAuth2 / OIDC (optional, HTTP/SSE only)
 
-All four variables must be set together to enable OAuth. When enabled, the
-server advertises its OAuth metadata at the standard well-known endpoints and
-exposes `/oauth/authorize` and `/oauth/callback` for the authorization-code
-flow.
+The MCP server acts purely as an OAuth-protected resource: it advertises its
+authorization server at `/.well-known/oauth-protected-resource` and validates
+incoming Bearer JWTs against that issuer's JWKS. The MCP client (e.g. ChatGPT)
+runs the authorization-code + PKCE flow directly with your provider — the MCP
+server does not host an `/oauth/authorize`, `/oauth/callback`, or `/oauth/token`
+endpoint.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `OAUTH_ISSUER_URL` | no | — | OIDC issuer URL (e.g. `https://auth.example.com`) |
-| `OAUTH_CLIENT_ID` | no | — | OAuth client ID from your OIDC provider |
-| `OAUTH_CLIENT_SECRET` | no | — | OAuth client secret from your OIDC provider |
-| `OAUTH_SERVER_URL` | no | — | Public URL where this MCP server is reachable, used to build the OAuth callback (e.g. `https://mealiemcp.example.com/mcp`) |
+| `OAUTH_ISSUER_URL` | no | — | Application-specific issuer URL, e.g. `https://auth.example.com/application/o/mealie-mcp/`. Must match the `iss` claim minted into your tokens. |
+| `OAUTH_CLIENT_ID` | no | — | OAuth client ID from your provider. |
+| `OAUTH_CLIENT_SECRET` | no | — | Optional. Leave blank for Public/PKCE clients (recommended for ChatGPT). |
+| `OAUTH_SERVER_URL` | no | — | Public URL of this MCP server including `/mcp`, e.g. `https://mealiemcp.example.com/mcp`. |
 
-The OAuth `redirect_uri` registered with your provider must be
-`<OAUTH_SERVER_URL>/oauth/callback`. The default authorization/token paths are
-Authentik-style (`/application/o/authorize/`, `/application/o/token/`); other
-providers may require code adjustments in `src/mealie_mcp/auth.py`.
+OAuth is enabled when `OAUTH_ISSUER_URL`, `OAUTH_CLIENT_ID`, and
+`OAUTH_SERVER_URL` are all set. With OAuth enabled, requests to `/mcp`,
+`/sse`, and `/messages` without a valid Bearer JWT receive `401` plus a
+`WWW-Authenticate: Bearer resource_metadata="…"` challenge that triggers the
+MCP client's discovery flow.
+
+#### Authentik recipe
+
+1. Create an OAuth2/OpenID Provider in Authentik.
+2. Set the **Client type** to **Public**. This is what causes Authentik's
+   discovery doc to advertise `none` in `token_endpoint_auth_methods_supported`,
+   which ChatGPT requires for PKCE.
+3. Add the redirect URI shown by your MCP client (ChatGPT's custom-connector
+   setup screen will display one) to **Redirect URIs / Origins**.
+4. Bind the provider to an Application; the Application slug becomes the last
+   path segment of `OAUTH_ISSUER_URL`, e.g.
+   `https://auth.example.com/application/o/<app-slug>/`.
+5. Copy the Client ID into `OAUTH_CLIENT_ID` (and into ChatGPT's connector
+   form). Leave `OAUTH_CLIENT_SECRET` blank.
+
+To verify before pointing ChatGPT at it:
+
+```bash
+curl https://<your-mcp>/.well-known/oauth-protected-resource
+# expect: {"resource":"<OAUTH_SERVER_URL>","authorization_servers":["<OAUTH_ISSUER_URL>"]}
+
+curl <OAUTH_ISSUER_URL>/.well-known/openid-configuration | jq '.issuer, .token_endpoint_auth_methods_supported'
+# expect: issuer matches OAUTH_ISSUER_URL exactly, and "none" is in the methods list.
+```
+
+If `issuer` doesn't match `OAUTH_ISSUER_URL`, you've used the wrong URL (most
+likely the bare host instead of the app-specific path). If `none` is missing,
+your Authentik provider is still set to Confidential — change it to Public.
 
 ## Install & run locally
 
@@ -230,8 +261,8 @@ mealie-mcp/
 └── src/mealie_mcp/
     ├── __init__.py
     ├── __main__.py        # CLI entry point (loads .env, dispatches transport)
-    ├── server.py          # FastMCP server + tool definitions + OAuth routes
-    ├── auth.py            # OAuth2/OIDC helpers (discovery, code exchange)
+    ├── server.py          # FastMCP server + tool definitions + Bearer auth middleware
+    ├── auth.py            # OAuth2/OIDC token validation against issuer JWKS
     └── client.py          # Async httpx wrapper for the Mealie REST API
 ```
 
