@@ -132,8 +132,11 @@ MCP client's discovery flow.
 To verify before pointing ChatGPT at it:
 
 ```bash
-curl https://<your-mcp>/.well-known/oauth-protected-resource
+curl https://<your-mcp>/.well-known/oauth-protected-resource/mcp
 # expect: {"resource":"<OAUTH_SERVER_URL>","authorization_servers":["<OAUTH_ISSUER_URL>"]}
+
+# The root metadata URL is also served for clients that discover there:
+curl https://<your-mcp>/.well-known/oauth-protected-resource
 
 curl <OAUTH_ISSUER_URL>/.well-known/openid-configuration | jq '.issuer, .token_endpoint_auth_methods_supported'
 # expect: issuer matches OAUTH_ISSUER_URL exactly, and "none" is in the methods list.

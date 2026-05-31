@@ -123,7 +123,9 @@ class MealieClient:
         merged = {**current, **patch}
         return await self._request("PUT", f"/api/recipes/{slug}", json=merged)
 
-    async def import_recipe_from_url(self, url: str, *, include_tags: bool = True) -> dict[str, Any]:
+    async def import_recipe_from_url(
+        self, url: str, *, include_tags: bool = True
+    ) -> dict[str, Any]:
         """Scrape a recipe from an external URL and save it to Mealie."""
         result = await self._request(
             "POST", "/api/recipes/create/url", json={"url": url, "includeTags": include_tags}
@@ -184,7 +186,7 @@ class MealieClient:
         """Return existing tag by name (case-insensitive) or create it."""
         result = await self.list_tags()
         items = result.get("items") if isinstance(result, dict) else result
-        for tag in (items or []):
+        for tag in items or []:
             if isinstance(tag, dict) and tag.get("name", "").lower() == name.lower():
                 return tag
         return await self.create_tag(name)
@@ -192,7 +194,9 @@ class MealieClient:
     # ---- Organizers: Categories --------------------------------------------------
 
     async def list_categories(self, *, per_page: int = 1000) -> dict[str, Any]:
-        return await self._request("GET", "/api/organizers/categories", params={"perPage": per_page})
+        return await self._request(
+            "GET", "/api/organizers/categories", params={"perPage": per_page}
+        )
 
     async def create_category(self, name: str) -> dict[str, Any]:
         return await self._request("POST", "/api/organizers/categories", json={"name": name})
@@ -201,7 +205,7 @@ class MealieClient:
         """Return existing category by name (case-insensitive) or create it."""
         result = await self.list_categories()
         items = result.get("items") if isinstance(result, dict) else result
-        for cat in (items or []):
+        for cat in items or []:
             if isinstance(cat, dict) and cat.get("name", "").lower() == name.lower():
                 return cat
         return await self.create_category(name)
@@ -218,7 +222,7 @@ class MealieClient:
         """Return existing tool by name (case-insensitive) or create it."""
         result = await self.list_recipe_tools()
         items = result.get("items") if isinstance(result, dict) else result
-        for tool in (items or []):
+        for tool in items or []:
             if isinstance(tool, dict) and tool.get("name", "").lower() == name.lower():
                 return tool
         return await self.create_recipe_tool(name)
@@ -261,6 +265,7 @@ class MealieClient:
     ) -> Any:
         """Decode a base64 image string and upload it to the recipe."""
         import base64
+
         try:
             content = base64.b64decode(b64_data)
         except Exception as exc:
@@ -295,7 +300,9 @@ class MealieClient:
         body = {"shoppingListId": list_id, "note": note, "isFood": False, "checked": False}
         return await self._request("POST", "/api/households/shopping/items", json=body)
 
-    async def check_off_shopping_item(self, item_id: str, *, checked: bool = True) -> dict[str, Any]:
+    async def check_off_shopping_item(
+        self, item_id: str, *, checked: bool = True
+    ) -> dict[str, Any]:
         """Toggle the checked state of a shopping list item."""
         current = await self._request("GET", f"/api/households/shopping/items/{item_id}")
         if not isinstance(current, dict):
