@@ -2,21 +2,22 @@
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
-from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .client import MealieClient, MealieError
 from .auth import OAuthConfig, extract_bearer_token
+from .client import MealieClient, MealieError
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,20 @@ def _load_settings() -> tuple[str, str, OAuthConfig | None]:
         )
 
     return base_url, token, oauth_config
+
+
+def _oauth_protected_resource_metadata_url(server_url: str) -> str:
+    """Return the RFC 9728 protected-resource metadata URL for an MCP resource.
+
+    For a resource like ``https://example.com/mcp``, clients are allowed to
+    discover metadata at ``https://example.com/.well-known/oauth-protected-resource/mcp``.
+    """
+    parsed = urlsplit(server_url.rstrip("/"))
+    resource_path = parsed.path.rstrip("/")
+    metadata_path = "/.well-known/oauth-protected-resource"
+    if resource_path:
+        metadata_path = f"{metadata_path}{resource_path}"
+    return urlunsplit((parsed.scheme, parsed.netloc, metadata_path, "", ""))
 
 
 def _configure_transport_security(server: FastMCP) -> None:
@@ -107,7 +122,7 @@ def _section_title(line: str) -> str | None:
     stripped = line.lstrip()
     for prefix in ("### ", "## ", "# "):
         if stripped.startswith(prefix):
-            return stripped[len(prefix):].strip()
+            return stripped[len(prefix) :].strip()
     return None
 
 
@@ -184,6 +199,7 @@ class _BearerAuthMiddleware:
     """
 
     _PUBLIC_PREFIXES = ("/health", "/.well-known/")
+    _PUBLIC_SEGMENTS = ("/.well-known/",)
     _PROTECTED_PREFIXES = ("/mcp", "/sse", "/messages")
 
     def __init__(self, app: ASGIApp, oauth_config: OAuthConfig | None) -> None:
@@ -196,8 +212,10 @@ class _BearerAuthMiddleware:
             return
 
         path = scope.get("path", "")
-        if path.startswith(self._PUBLIC_PREFIXES) or not path.startswith(
-            self._PROTECTED_PREFIXES
+        if (
+            path.startswith(self._PUBLIC_PREFIXES)
+            or any(segment in path for segment in self._PUBLIC_SEGMENTS)
+            or not path.startswith(self._PROTECTED_PREFIXES)
         ):
             await self.app(scope, receive, send)
             return
@@ -205,23 +223,22 @@ class _BearerAuthMiddleware:
         token = extract_bearer_token(scope.get("headers", []))
         claims = await self.oauth_config.verify_token(token) if token else None
         if claims is None:
-            resource_metadata = (
-                f"{self.oauth_config.server_url}/.well-known/oauth-protected-resource"
-            )
+            resource_metadata = _oauth_protected_resource_metadata_url(self.oauth_config.server_url)
             challenge = (
-                f'Bearer realm="mealie-mcp", '
-                f'resource_metadata="{resource_metadata}"'
+                f'Bearer realm="mealie-mcp", resource_metadata="{resource_metadata}"'
             ).encode()
             body = b'{"error":"unauthorized"}'
-            await send({
-                "type": "http.response.start",
-                "status": 401,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode()),
-                    (b"www-authenticate", challenge),
-                ],
-            })
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                        (b"www-authenticate", challenge),
+                    ],
+                }
+            )
             await send({"type": "http.response.body", "body": body, "more_body": False})
             return
 
@@ -267,11 +284,16 @@ class _ContentTypeFixMiddleware:
             if not body and not more_body:
                 # Empty-body POST — ChatGPT probes the endpoint before starting
                 # the MCP handshake. Acknowledge so it proceeds.
-                await send({
-                    "type": "http.response.start",
-                    "status": 200,
-                    "headers": [(b"content-type", b"application/json"), (b"content-length", b"2")],
-                })
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 200,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"content-length", b"2"),
+                        ],
+                    }
+                )
                 await send({"type": "http.response.body", "body": b"{}", "more_body": False})
                 return
 
@@ -304,14 +326,27 @@ def build_server() -> FastMCP:
     # Authentik's app path), then fall back to /.well-known/openid-configuration
     # (200). Because it discovers from Authentik directly, the issuer and iss values
     # all match and the token exchange works with the user's configured client_secret.
-    @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
-    async def oauth_protected_resource(request: Request) -> JSONResponse:
+    def _oauth_protected_resource_response() -> JSONResponse:
         if oauth_config is None:
             return JSONResponse({"error": "OAuth not configured"}, status_code=404)
-        return JSONResponse({
-            "resource": oauth_config.server_url,
-            "authorization_servers": [oauth_config.issuer_url],
-        })
+        return JSONResponse(
+            {
+                "resource": oauth_config.server_url,
+                "authorization_servers": [oauth_config.issuer_url],
+            }
+        )
+
+    @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+    async def oauth_protected_resource(request: Request) -> JSONResponse:
+        return _oauth_protected_resource_response()
+
+    @mcp.custom_route("/.well-known/oauth-protected-resource/{resource_path:path}", methods=["GET"])
+    async def oauth_protected_resource_for_path(request: Request) -> JSONResponse:
+        return _oauth_protected_resource_response()
+
+    @mcp.custom_route("/mcp/.well-known/oauth-protected-resource", methods=["GET"])
+    async def oauth_protected_resource_legacy_mcp_path(request: Request) -> JSONResponse:
+        return _oauth_protected_resource_response()
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health_check(request: Request) -> JSONResponse:
@@ -333,9 +368,7 @@ def build_server() -> FastMCP:
         """
         per_page = max(1, min(limit, 100))
         try:
-            payload = await _client(ctx).search_recipes(
-                query=query, tags=tags, per_page=per_page
-            )
+            payload = await _client(ctx).search_recipes(query=query, tags=tags, per_page=per_page)
         except MealieError as exc:
             raise RuntimeError(str(exc)) from exc
         items = payload.get("items") if isinstance(payload, dict) else payload
@@ -350,9 +383,7 @@ def build_server() -> FastMCP:
             raise RuntimeError(str(exc)) from exc
 
     @mcp.tool()
-    async def list_meal_plan(
-        ctx: Context, start_date: str, end_date: str
-    ) -> list[dict[str, Any]]:
+    async def list_meal_plan(ctx: Context, start_date: str, end_date: str) -> list[dict[str, Any]]:
         """List meal plan entries between two dates (inclusive).
 
         Args:
@@ -399,7 +430,9 @@ def build_server() -> FastMCP:
                 continue
             try:
                 created = await client.add_shopping_list_item(list_id=list_id, note=text)
-                added.append({"id": created.get("id") if isinstance(created, dict) else None, "note": text})
+                added.append(
+                    {"id": created.get("id") if isinstance(created, dict) else None, "note": text}
+                )
             except MealieError as exc:
                 errors.append({"note": text, "error": str(exc)})
         return {"added": added, "errors": errors}
@@ -494,7 +527,11 @@ def build_server() -> FastMCP:
             updated = await client.update_recipe(slug, patch)
         except MealieError as exc:
             raise RuntimeError(f"Recipe '{slug}' was created but update failed: {exc}") from exc
-        return _summarize_recipe(updated) if isinstance(updated, dict) else {"slug": slug, "name": name}
+        return (
+            _summarize_recipe(updated)
+            if isinstance(updated, dict)
+            else {"slug": slug, "name": name}
+        )
 
     @mcp.tool()
     async def update_recipe(
@@ -533,8 +570,10 @@ def build_server() -> FastMCP:
             instructions: Ordered steps; "### Base" style lines become sections.
             notes: Free-text recipe notes (one entry per note).
             tags: Tag names to apply (replaces existing tags). Tags are created if they don't exist.
-            categories: Category names to apply (replaces existing). Categories are created if they don't exist.
-            tools: Tool/equipment names to apply (replaces existing). Tools are created if they don't exist.
+            categories: Category names to apply (replaces existing). Categories are created if they
+                don't exist.
+            tools: Tool/equipment names to apply (replaces existing). Tools are created if they
+                don't exist.
         """
         client = _client(ctx)
 
@@ -791,7 +830,8 @@ def build_server() -> FastMCP:
         """Delete a meal plan entry by its ID.
 
         Args:
-            entry_id: The meal plan entry ID returned by ``list_meal_plan`` or ``create_meal_plan_entry``.
+            entry_id: The meal plan entry ID returned by ``list_meal_plan`` or
+                ``create_meal_plan_entry``.
         """
         try:
             await _client(ctx).delete_meal_plan_entry(entry_id)
